@@ -85,6 +85,8 @@ risk:
   target_r_multiples: [1.5, 2.0, 3.0]
   min_confidence_for_trade: 0.45
   skip_if_atr_pct_above: 0.12
+  min_avg_volume: 500000
+  max_entry_distance_from_vwap_pct: 0.08
 
 context_agent:
   enabled: true
@@ -104,6 +106,8 @@ backtest:
   lookback_rows: 90
   holding_period_days: 5
   evaluation_step_days: 5
+  slippage_bps: 5
+  commission_per_trade: 1.00
   model_subset:
     - baseline
 

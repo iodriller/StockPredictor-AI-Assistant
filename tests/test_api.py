@@ -24,10 +24,21 @@ def test_api_health_config_and_analyze(tmp_path: Path) -> None:
     analysis = client.post("/analyze/TEST")
     assert analysis.status_code == 200
     assert analysis.json()["snapshot"]["symbol"] == "TEST"
+    assert "scanner_row" in analysis.json()
+    assert "setup_quality" in analysis.json()["risk_plan"]
 
     latest = client.get("/signals/latest")
     assert latest.status_code == 200
     assert latest.json()[0]["snapshot"]["symbol"] == "TEST"
+
+    scan = client.post("/scan", json={"symbols": ["TEST"]})
+    assert scan.status_code == 200
+    assert scan.json()[0]["scanner_row"]["symbol"] == "TEST"
+
+    backtest = client.post("/backtest", json={"symbols": ["TEST"]})
+    assert backtest.status_code == 200
+    assert "trade_log" in backtest.json()
+    assert "evaluations" in backtest.json()
 
 
 def _api_config(tmp_path: Path) -> Path:

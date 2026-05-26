@@ -46,7 +46,7 @@ class SyntheticProvider:
         rows = _period_to_rows(period, interval)
         stable_symbol_seed = sum((idx + 1) * ord(char) for idx, char in enumerate(symbol.upper()))
         rng = np.random.default_rng(self.seed + stable_symbol_seed)
-        index = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=rows, freq="B")
+        index = pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=rows, freq="B")
         drift = 0.0008 + (stable_symbol_seed % 9) / 10000
         shocks = rng.normal(drift, 0.018, rows)
         close = 100 * np.exp(np.cumsum(shocks))
@@ -117,6 +117,9 @@ def fetch_market_data(symbol: str, settings: Settings, provider: MarketDataProvi
 
 def build_snapshot(symbol: str, frame: pd.DataFrame, settings: Settings, provider_name: str) -> MarketSnapshot:
     latest = frame.iloc[-1]
+    previous_close = frame["Close"].iloc[-2] if len(frame) > 1 else latest["Close"]
+    avg_volume = frame["Volume"].tail(int(settings.features.get("volume_window", 20))).mean()
+    change_pct = ((latest["Close"] / previous_close) - 1) if previous_close else 0.0
     as_of = frame.index[-1].isoformat() if hasattr(frame.index[-1], "isoformat") else datetime.now(timezone.utc).isoformat()
     return MarketSnapshot(
         symbol=symbol.upper(),
@@ -126,6 +129,8 @@ def build_snapshot(symbol: str, frame: pd.DataFrame, settings: Settings, provide
         rows=int(len(frame)),
         latest_close=to_float(latest["Close"]),
         latest_volume=to_float(latest.get("Volume")),
+        change_pct=to_float(change_pct),
+        avg_volume=to_float(avg_volume),
     )
 
 

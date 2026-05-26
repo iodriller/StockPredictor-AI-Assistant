@@ -19,6 +19,10 @@ def apply_risk_controls(
     latest_price = to_float(frame["Close"].iloc[-1])
     atr = to_float(features.indicators.get("atr"), latest_price * 0.02)
     atr_pct = to_float(features.indicators.get("atr_pct"), atr / latest_price if latest_price else 0.0)
+    avg_volume = to_float(features.indicators.get("avg_volume"), frame["Volume"].tail(20).mean())
+    vwap = to_float(features.indicators.get("vwap"), 0.0)
+    support = to_float(features.indicators.get("support"), 0.0)
+    resistance = to_float(features.indicators.get("resistance"), 0.0)
     notes: list[str] = []
 
     if decision.action not in {"long", "short"}:
@@ -29,6 +33,9 @@ def apply_risk_controls(
             stop_loss=None,
             invalidation="No trade plan because the fused signal is not actionable.",
             notes=list(decision.reasons),
+            entry_zone=_entry_zone(latest_price, atr, decision.action),
+            liquidity_ok=avg_volume >= float(risk_cfg.get("min_avg_volume", 0)),
+            setup_quality="not_actionable",
         )
 
     if decision.confidence < float(risk_cfg.get("min_confidence_for_trade", 0.45)):
@@ -40,6 +47,24 @@ def apply_risk_controls(
             stop_loss=None,
             invalidation="Confidence is below configured trade threshold.",
             notes=adjusted.reasons,
+            entry_zone=_entry_zone(latest_price, atr, adjusted.action),
+            liquidity_ok=avg_volume >= float(risk_cfg.get("min_avg_volume", 0)),
+            setup_quality="low_confidence",
+        )
+
+    min_avg_volume = float(risk_cfg.get("min_avg_volume", 0))
+    if avg_volume < min_avg_volume:
+        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: liquidity below configured minimum"])
+        return adjusted, RiskPlan(
+            symbol=decision.symbol,
+            action=adjusted.action,
+            entry=None,
+            stop_loss=None,
+            invalidation="Average volume is below configured liquidity minimum.",
+            notes=adjusted.reasons,
+            entry_zone=_entry_zone(latest_price, atr, adjusted.action),
+            liquidity_ok=False,
+            setup_quality="low_liquidity",
         )
 
     if atr_pct > float(risk_cfg.get("skip_if_atr_pct_above", 0.12)):
@@ -51,18 +76,41 @@ def apply_risk_controls(
             stop_loss=None,
             invalidation="Volatility is above configured maximum.",
             notes=adjusted.reasons,
+            entry_zone=_entry_zone(latest_price, atr, adjusted.action),
+            liquidity_ok=True,
+            setup_quality="too_volatile",
+        )
+
+    max_vwap_distance = float(risk_cfg.get("max_entry_distance_from_vwap_pct", 1.0))
+    if vwap and abs(latest_price / vwap - 1) > max_vwap_distance:
+        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: price too extended from VWAP"])
+        return adjusted, RiskPlan(
+            symbol=decision.symbol,
+            action=adjusted.action,
+            entry=latest_price,
+            stop_loss=None,
+            invalidation="Price is too far from VWAP for a fresh entry.",
+            notes=adjusted.reasons,
+            entry_zone=_entry_zone(latest_price, atr, adjusted.action),
+            liquidity_ok=True,
+            setup_quality="extended",
         )
 
     entry = latest_price
+    entry_zone = _entry_zone(latest_price, atr, decision.action)
     stop_distance = max(atr * float(risk_cfg.get("atr_stop_multiple", 1.5)), entry * 0.003)
     if decision.action == "long":
-        stop_loss = entry - stop_distance
-        targets = [entry + stop_distance * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
-        invalidation = "Long idea is invalid below stop loss or sustained loss of VWAP/support."
+        structural_stop = max(value for value in [support, vwap, entry - stop_distance] if value > 0 and value < entry)
+        stop_loss = min(entry - entry * 0.003, structural_stop - atr * 0.20)
+        raw_targets = [entry + abs(entry - stop_loss) * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
+        targets = _merge_structural_target(raw_targets, resistance, long=True)
+        invalidation = "Long idea is invalid below stop loss, nearby support, or sustained loss of VWAP."
     else:
-        stop_loss = entry + stop_distance
-        targets = [entry - stop_distance * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
-        invalidation = "Short idea is invalid above stop loss or sustained reclaim of VWAP/resistance."
+        structural_stop = min(value for value in [resistance, vwap, entry + stop_distance] if value > entry)
+        stop_loss = max(entry + entry * 0.003, structural_stop + atr * 0.20)
+        raw_targets = [entry - abs(entry - stop_loss) * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
+        targets = _merge_structural_target(raw_targets, support, long=False)
+        invalidation = "Short idea is invalid above stop loss, nearby resistance, or sustained reclaim of VWAP."
 
     risk_reward = abs(targets[0] - entry) / abs(entry - stop_loss)
     if risk_reward < float(risk_cfg.get("min_risk_reward", 1.5)):
@@ -76,6 +124,9 @@ def apply_risk_controls(
             risk_reward=risk_reward,
             invalidation="Risk/reward is below configured minimum.",
             notes=adjusted.reasons,
+            entry_zone=entry_zone,
+            liquidity_ok=True,
+            setup_quality="poor_risk_reward",
         )
 
     account_size = float(risk_cfg.get("account_size", 100000))
@@ -96,10 +147,14 @@ def apply_risk_controls(
             position_size=0,
             invalidation="Configured account/risk limits do not allow a valid position size.",
             notes=adjusted.reasons,
+            entry_zone=entry_zone,
+            liquidity_ok=True,
+            setup_quality="invalid_position_size",
         )
 
     notes.append(f"Max planned account risk is {max_position_risk:.2f}.")
     notes.append(f"Position size is capped at {position_size} shares by risk and exposure limits.")
+    notes.append(f"Entry zone is {entry_zone[0]:.2f} to {entry_zone[1]:.2f}.")
     return decision, RiskPlan(
         symbol=decision.symbol,
         action=decision.action,
@@ -111,5 +166,27 @@ def apply_risk_controls(
         position_size=position_size,
         invalidation=invalidation,
         notes=notes,
+        entry_zone=entry_zone,
+        liquidity_ok=True,
+        setup_quality="actionable",
     )
 
+
+def _entry_zone(price: float, atr: float, action: str) -> tuple[float, float] | None:
+    if action not in {"long", "short"} or price <= 0:
+        return None
+    cushion = max(atr * 0.25, price * 0.002)
+    if action == "long":
+        return (price - cushion, price + cushion * 0.5)
+    return (price - cushion * 0.5, price + cushion)
+
+
+def _merge_structural_target(raw_targets: list[float], structural_level: float, long: bool) -> list[float]:
+    if not structural_level:
+        return raw_targets
+    first = raw_targets[0]
+    if long and structural_level > first:
+        raw_targets[0] = structural_level
+    if not long and 0 < structural_level < first:
+        raw_targets[0] = structural_level
+    return raw_targets

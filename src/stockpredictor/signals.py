@@ -29,6 +29,8 @@ def fuse_signals(
         reasons.append("context has catalyst input")
     if context.risks:
         reasons.append("context has risk input")
+    reasons.extend(context.reasons_to_trade[:2])
+    reasons.extend(context.reasons_to_skip[:2])
     if disagreement:
         penalty = float(thresholds.get("disagreement_penalty", 0.18))
         score *= 1 - penalty
@@ -51,6 +53,7 @@ def fuse_signals(
         feature_scores={"technicals": technical_score, "sentiment": sentiment_score},
         context_score=context_score,
         created_at=now_utc_iso(),
+        top_reason=_dedupe(reasons)[0] if reasons else "",
     )
 
 
@@ -94,4 +97,3 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(value)
             output.append(value)
     return output
-

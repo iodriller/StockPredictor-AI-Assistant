@@ -8,12 +8,14 @@ from .contracts import ContextSummary
 from .utils import clamp
 
 
-POSITIVE_WORDS = {"beat", "beats", "raise", "raises", "upgrade", "growth", "approval", "strong", "record", "deal"}
-NEGATIVE_WORDS = {"miss", "misses", "cut", "downgrade", "probe", "lawsuit", "weak", "warning", "delay", "risk"}
+POSITIVE_WORDS = {"beat", "beats", "raise", "raises", "upgrade", "growth", "approval", "strong", "record", "deal", "guidance"}
+NEGATIVE_WORDS = {"miss", "misses", "cut", "downgrade", "probe", "lawsuit", "weak", "warning", "delay", "risk", "recall"}
 
 
 def build_context_summary(symbol: str, settings: Settings, include_live_sources: bool = True) -> ContextSummary:
     cfg = settings.context_agent
+    mind_file = _resolve_mind_file(settings, str(cfg.get("mind_file", "traders.mind.md")))
+    checklist = _load_trader_checklist(mind_file)
     if not cfg.get("enabled", False):
         return ContextSummary(
             symbol=symbol.upper(),
@@ -21,7 +23,8 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             score=0.0,
             sentiment="neutral",
             raw_summary="Context agent disabled by configuration.",
-            features={"context_confidence": 0.0},
+            features={"context_confidence": 0.0, "checklist_items": float(len(checklist))},
+            reasons_to_skip=["context agent disabled"],
         )
 
     items: list[dict[str, Any]] = []
@@ -33,7 +36,12 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
 
     catalysts: list[str] = []
     risks: list[str] = []
+    reasons_to_trade: list[str] = []
+    reasons_to_skip: list[str] = []
     score_parts: list[float] = []
+    freshness_parts: list[float] = []
+    market_alignment_parts: list[float] = []
+    sector_alignment_parts: list[float] = []
     used_sources: list[str] = []
     for item in items:
         title = str(item.get("title") or item.get("headline") or "").strip()
@@ -41,16 +49,30 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             continue
         impact = _score_item(title, item)
         score_parts.append(impact)
+        freshness_parts.append(_bounded_item_float(item, "freshness", default=0.5))
+        market_alignment_parts.append(_bounded_item_float(item, "market_alignment", default=0.0))
+        sector_alignment_parts.append(_bounded_item_float(item, "sector_alignment", default=0.0))
         used_sources.append(str(item.get("source", "configured")))
         if impact >= 0.15:
             catalysts.append(title)
+            reasons_to_trade.append(f"positive catalyst: {title}")
         elif impact <= -0.15:
             risks.append(title)
+            reasons_to_skip.append(f"context risk: {title}")
 
-    score = clamp(sum(score_parts) / len(score_parts), -1.0, 1.0) if score_parts else 0.0
+    catalyst_score = clamp(sum(score_parts) / len(score_parts), -1.0, 1.0) if score_parts else 0.0
+    catalyst_freshness = clamp(sum(freshness_parts) / len(freshness_parts), 0.0, 1.0) if freshness_parts else 0.0
+    market_alignment = clamp(sum(market_alignment_parts) / len(market_alignment_parts), -1.0, 1.0) if market_alignment_parts else 0.0
+    sector_alignment = clamp(sum(sector_alignment_parts) / len(sector_alignment_parts), -1.0, 1.0) if sector_alignment_parts else 0.0
+    score = clamp((catalyst_score * 0.65) + (market_alignment * 0.20) + (sector_alignment * 0.15), -1.0, 1.0)
     sentiment = "bullish" if score > 0.15 else "bearish" if score < -0.15 else "neutral"
-    mind_file = _resolve_mind_file(settings, str(cfg.get("mind_file", "traders.mind.md")))
-    raw_summary = _summarize_context(symbol, catalysts, risks, mind_file)
+    if not catalysts:
+        reasons_to_skip.append("no strong configured catalyst")
+    if score < 0:
+        reasons_to_skip.append("context score is negative")
+    if score > 0 and catalysts:
+        reasons_to_trade.append("context supports the setup")
+    raw_summary = _summarize_context(symbol, catalysts, risks, mind_file, checklist)
     return ContextSummary(
         symbol=symbol.upper(),
         enabled=True,
@@ -64,8 +86,15 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             "context_confidence": min(1.0, len(score_parts) / 4) if score_parts else 0.0,
             "catalyst_count": float(len(catalysts)),
             "risk_count": float(len(risks)),
+            "catalyst_score": catalyst_score,
+            "catalyst_freshness": catalyst_freshness,
+            "market_alignment": market_alignment,
+            "sector_alignment": sector_alignment,
+            "checklist_items": float(len(checklist)),
             "llm_enabled": bool(cfg.get("llm_enabled", False)),
         },
+        reasons_to_trade=_dedupe(reasons_to_trade)[:8],
+        reasons_to_skip=_dedupe(reasons_to_skip)[:8],
     )
 
 
@@ -102,6 +131,13 @@ def _score_item(title: str, item: dict[str, Any]) -> float:
     return clamp((positive - negative) * 0.20, -0.8, 0.8)
 
 
+def _bounded_item_float(item: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return clamp(float(item.get(key, default)), -1.0, 1.0)
+    except (TypeError, ValueError):
+        return default
+
+
 def _resolve_mind_file(settings: Settings, mind_file: str) -> Path:
     path = Path(mind_file)
     if path.is_absolute():
@@ -109,10 +145,17 @@ def _resolve_mind_file(settings: Settings, mind_file: str) -> Path:
     return (settings.path.parent.parent / path).resolve()
 
 
-def _summarize_context(symbol: str, catalysts: list[str], risks: list[str], mind_file: Path) -> str:
+def _load_trader_checklist(mind_file: Path) -> list[str]:
+    if not mind_file.exists():
+        return []
+    lines = mind_file.read_text(encoding="utf-8").splitlines()
+    return [line[2:].strip() for line in lines if line.startswith("- ") and line[2:].strip()]
+
+
+def _summarize_context(symbol: str, catalysts: list[str], risks: list[str], mind_file: Path, checklist: list[str]) -> str:
     checklist = "trader checklist unavailable"
     if mind_file.exists():
-        checklist = "trader checklist loaded"
+        checklist = f"trader checklist loaded with {len(_load_trader_checklist(mind_file))} items"
     if catalysts or risks:
         parts = [f"{symbol.upper()} context summary ({checklist})."]
         if catalysts:
@@ -121,3 +164,13 @@ def _summarize_context(symbol: str, catalysts: list[str], risks: list[str], mind
             parts.append("Risks: " + "; ".join(risks[:3]))
         return " ".join(parts)
     return f"{symbol.upper()} has no strong configured catalyst. {checklist}; default to price, volume, levels, and risk controls."
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            output.append(value)
+    return output

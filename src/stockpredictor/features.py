@@ -41,46 +41,67 @@ def calculate_indicators(frame: pd.DataFrame, settings: Settings) -> dict[str, f
     open_ = frame["Open"]
     volume = frame["Volume"]
     features_cfg = settings.features
+    enabled = set(features_cfg.get("enabled", []))
+    latest_values: dict[str, float | str | None] = {}
 
-    typical_price = (high + low + close) / 3
-    cumulative_volume = volume.cumsum().replace(0, np.nan)
-    vwap = (typical_price * volume).cumsum() / cumulative_volume
+    previous_close = close.shift(1)
+    latest_values["price_change_pct"] = to_float(close.pct_change().iloc[-1], 0.0)
+    latest_values["range_pct"] = to_float((high.iloc[-1] - low.iloc[-1]) / close.iloc[-1], 0.0)
 
-    ma_windows = [int(window) for window in features_cfg.get("ma_windows", [9, 20, 50])]
-    moving_averages = {f"sma_{window}": close.rolling(window).mean() for window in ma_windows}
+    if "vwap" in enabled:
+        typical_price = (high + low + close) / 3
+        cumulative_volume = volume.cumsum().replace(0, np.nan)
+        vwap = (typical_price * volume).cumsum() / cumulative_volume
+        latest_values["vwap"] = to_float(vwap.iloc[-1], None)
 
-    rsi = _rsi(close)
-    macd_line, macd_signal, macd_hist = _macd(close)
-    atr = _atr(high, low, close)
+    if "moving_averages" in enabled:
+        ma_windows = [int(window) for window in features_cfg.get("ma_windows", [9, 20, 50])]
+        moving_averages = {f"sma_{window}": close.rolling(window).mean() for window in ma_windows}
+        for name, series in moving_averages.items():
+            latest_values[name] = to_float(series.iloc[-1], None)
+
+    if "rsi" in enabled:
+        rsi = _rsi(close)
+        latest_values["rsi"] = to_float(rsi.iloc[-1], None)
+
+    if "macd" in enabled:
+        macd_line, macd_signal, macd_hist = _macd(close)
+        latest_values["macd"] = to_float(macd_line.iloc[-1], None)
+        latest_values["macd_signal"] = to_float(macd_signal.iloc[-1], None)
+        latest_values["macd_hist"] = to_float(macd_hist.iloc[-1], None)
+
+    if "atr" in enabled:
+        atr = _atr(high, low, close)
+        latest_values["atr"] = to_float(atr.iloc[-1], None)
+        latest_values["atr_pct"] = to_float(atr.iloc[-1] / close.iloc[-1], None)
+
     volume_window = int(features_cfg.get("volume_window", 20))
     avg_volume = volume.rolling(volume_window).mean()
-    volume_anomaly = volume / avg_volume.replace(0, np.nan)
-    volatility_window = int(features_cfg.get("volatility_window", 20))
-    volatility = close.pct_change().rolling(volatility_window).std()
-    sr_window = int(features_cfg.get("support_resistance_window", 30))
-    support = low.rolling(sr_window).min()
-    resistance = high.rolling(sr_window).max()
-    gap_pct = (open_ - close.shift(1)) / close.shift(1)
+    latest_values["avg_volume"] = to_float(avg_volume.iloc[-1], None)
+    if "volume_anomaly" in enabled:
+        volume_anomaly = volume / avg_volume.replace(0, np.nan)
+        latest_values["volume_anomaly"] = to_float(volume_anomaly.iloc[-1], None)
 
-    latest_values: dict[str, float | str | None] = {
-        "vwap": to_float(vwap.iloc[-1], None),
-        "rsi": to_float(rsi.iloc[-1], None),
-        "macd": to_float(macd_line.iloc[-1], None),
-        "macd_signal": to_float(macd_signal.iloc[-1], None),
-        "macd_hist": to_float(macd_hist.iloc[-1], None),
-        "atr": to_float(atr.iloc[-1], None),
-        "atr_pct": to_float(atr.iloc[-1] / close.iloc[-1], None),
-        "volume_anomaly": to_float(volume_anomaly.iloc[-1], None),
-        "volatility": to_float(volatility.iloc[-1], None),
-        "support": to_float(support.iloc[-1], None),
-        "resistance": to_float(resistance.iloc[-1], None),
-        "gap_pct": to_float(gap_pct.iloc[-1], 0.0),
-    }
-    for name, series in moving_averages.items():
-        latest_values[name] = to_float(series.iloc[-1], None)
+    if "volatility" in enabled:
+        volatility_window = int(features_cfg.get("volatility_window", 20))
+        volatility = close.pct_change().rolling(volatility_window).std()
+        latest_values["volatility"] = to_float(volatility.iloc[-1], None)
 
-    latest_values["trend"] = _trend_label(close.iloc[-1], latest_values)
-    latest_values["market_regime"] = _market_regime(latest_values)
+    if "support_resistance" in enabled:
+        sr_window = int(features_cfg.get("support_resistance_window", 30))
+        support = low.rolling(sr_window).min()
+        resistance = high.rolling(sr_window).max()
+        latest_values["support"] = to_float(support.iloc[-1], None)
+        latest_values["resistance"] = to_float(resistance.iloc[-1], None)
+
+    if "gap" in enabled:
+        gap_pct = (open_ - previous_close) / previous_close
+        latest_values["gap_pct"] = to_float(gap_pct.iloc[-1], 0.0)
+
+    if "trend" in enabled:
+        latest_values["trend"] = _trend_label(close.iloc[-1], latest_values)
+    if "market_regime" in enabled:
+        latest_values["market_regime"] = _market_regime(latest_values)
     return latest_values
 
 
@@ -209,4 +230,3 @@ def _num(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-

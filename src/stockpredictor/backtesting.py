@@ -24,6 +24,7 @@ def run_backtest(
     equity = initial_capital
     equity_curve: list[dict[str, float | str]] = []
     returns: list[float] = []
+    trade_log: list[dict[str, float | str | int]] = []
     no_trades = 0
     evaluations = 0
     start = ""
@@ -32,6 +33,8 @@ def run_backtest(
     lookback = int(cfg.get("lookback_rows", 90))
     holding = int(cfg.get("holding_period_days", 5))
     step = int(cfg.get("evaluation_step_days", 5))
+    slippage = float(cfg.get("slippage_bps", 0)) / 10000
+    commission = float(cfg.get("commission_per_trade", 0))
 
     for symbol in symbols:
         frame = fetch_market_data(symbol, settings, provider)
@@ -50,18 +53,57 @@ def run_backtest(
                 include_context=False,
             )
             evaluations += 1
-            if result.decision.action == "long":
-                trade_return = (future_close / current_close) - 1
-            elif result.decision.action == "short":
-                trade_return = (current_close / future_close) - 1
-            else:
+            plan = result.risk_plan
+            if result.decision.action not in {"long", "short"} or plan.entry is None or plan.stop_loss is None or not plan.targets:
                 no_trades += 1
+                trade_log.append(
+                    {
+                        "symbol": symbol.upper(),
+                        "date": frame.index[index].isoformat(),
+                        "action": result.decision.action,
+                        "exit_reason": "no_trade",
+                        "return": 0.0,
+                        "equity": equity,
+                    }
+                )
                 continue
+            future_window = frame.iloc[index + 1 : index + holding + 1]
+            exit_price, exit_reason, exit_date = _simulate_exit(result.decision.action, future_window, plan.stop_loss, plan.targets[0])
+            if exit_price is None:
+                exit_price = future_close
+                exit_reason = "time_exit"
+                exit_date = frame.index[index + holding].isoformat()
+            entry = current_close * (1 + slippage if result.decision.action == "long" else 1 - slippage)
+            exit_price = exit_price * (1 - slippage if result.decision.action == "long" else 1 + slippage)
+            if result.decision.action == "long":
+                trade_return = (exit_price / entry) - 1
+            else:
+                trade_return = (entry / exit_price) - 1
             position_fraction = float(settings.risk.get("max_position_fraction", 0.20))
-            portfolio_return = trade_return * position_fraction
+            position_value = equity * position_fraction
+            commission_return = commission / position_value if position_value else 0.0
+            portfolio_return = trade_return * position_fraction - commission_return
             equity *= 1 + portfolio_return
             returns.append(portfolio_return)
             equity_curve.append({"date": frame.index[index].isoformat(), "equity": equity, "symbol": symbol.upper()})
+            trade_log.append(
+                {
+                    "symbol": symbol.upper(),
+                    "date": frame.index[index].isoformat(),
+                    "action": result.decision.action,
+                    "entry": entry,
+                    "stop_loss": plan.stop_loss,
+                    "target": plan.targets[0],
+                    "exit_price": exit_price,
+                    "exit_date": exit_date,
+                    "exit_reason": exit_reason,
+                    "return": portfolio_return,
+                    "confidence": result.decision.confidence,
+                    "score": result.decision.score,
+                    "risk_reward": plan.risk_reward or 0.0,
+                    "equity": equity,
+                }
+            )
 
     trades = len(returns)
     win_rate = sum(1 for value in returns if value > 0) / trades if trades else 0.0
@@ -80,7 +122,10 @@ def run_backtest(
         max_drawdown=max_drawdown,
         sharpe_like=sharpe_like,
         no_trade_rate=no_trade_rate,
+        evaluations=evaluations,
+        no_trades=no_trades,
         equity_curve=equity_curve,
+        trade_log=trade_log,
     )
 
 
@@ -101,3 +146,21 @@ def _sharpe_like(returns: list[float]) -> float:
     if std == 0:
         return 0.0
     return float(np.mean(returns) / std * math.sqrt(252))
+
+
+def _simulate_exit(action: str, window: pd.DataFrame, stop_loss: float, target: float) -> tuple[float | None, str, str]:
+    for date, row in window.iterrows():
+        high = float(row["High"])
+        low = float(row["Low"])
+        date_text = date.isoformat() if hasattr(date, "isoformat") else str(date)
+        if action == "long":
+            if low <= stop_loss:
+                return stop_loss, "stop_hit", date_text
+            if high >= target:
+                return target, "target_hit", date_text
+        if action == "short":
+            if high >= stop_loss:
+                return stop_loss, "stop_hit", date_text
+            if low <= target:
+                return target, "target_hit", date_text
+    return None, "time_exit", ""

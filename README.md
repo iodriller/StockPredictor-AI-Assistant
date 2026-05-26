@@ -14,45 +14,42 @@ Quick Start
 
 ```powershell
 python -m venv .venv
-. .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+.\.venv\Scripts\python -m pip install -U pip
+.\.venv\Scripts\python -m pip install -e ".[dev]"
 ```
 
 Run the API:
 
 ```powershell
-stockpredictor api --config configs/default.yaml
+.\.venv\Scripts\python -m stockpredictor.cli api --config configs/default.yaml
 ```
 
 Run the dashboard:
 
 ```powershell
-stockpredictor dashboard --config configs/default.yaml
+.\.venv\Scripts\python -m stockpredictor.cli dashboard --config configs/default.yaml
 ```
 
 Analyze one symbol:
 
 ```powershell
-stockpredictor analyze AAPL --config configs/default.yaml
+.\.venv\Scripts\python -m stockpredictor.cli analyze AAPL --config configs/default.yaml
 ```
 
 Scan the configured watchlist:
 
 ```powershell
-stockpredictor scan --config configs/default.yaml
+.\.venv\Scripts\python -m stockpredictor.cli scan --config configs/default.yaml
 ```
 
 Run tests:
 
 ```powershell
-pytest
+.\.venv\Scripts\python -m pytest
 ```
 
-If `stockpredictor` is not on your PATH, use the module form instead:
-
-```powershell
-python -m stockpredictor.cli analyze AAPL --config configs/default.yaml
-```
+The module form is preferred on Windows because it does not depend on the user
+Python Scripts directory being on `PATH`.
 
 Configuration
 -------------

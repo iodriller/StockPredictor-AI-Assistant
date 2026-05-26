@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from stockpredictor.backtesting import run_backtest
@@ -51,9 +52,12 @@ def main() -> None:
     with backtest_tab:
         if st.button("Run Backtest"):
             report = run_backtest(settings, symbols=symbols or None)
-            st.dataframe(pd.DataFrame([asdict(report)]).drop(columns=["equity_curve"]), use_container_width=True)
+            st.dataframe(pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"]), use_container_width=True)
             if report.equity_curve:
                 st.line_chart(pd.DataFrame(report.equity_curve).set_index("date")["equity"])
+            if report.trade_log:
+                st.subheader("Trade Log")
+                st.dataframe(pd.DataFrame(report.trade_log), use_container_width=True)
     with config_tab:
         st.json(to_serializable(settings.raw))
 
@@ -61,21 +65,8 @@ def main() -> None:
 def _render_scanner(settings, symbols: list[str]) -> None:
     if st.button("Run Scan", type="primary"):
         results = scan_symbols(settings, symbols=symbols or None)
-        rows = []
-        for result in results:
-            rows.append(
-                {
-                    "symbol": result.snapshot.symbol,
-                    "action": result.decision.action,
-                    "confidence": round(result.decision.confidence, 3),
-                    "score": round(result.decision.score, 3),
-                    "price": round(result.snapshot.latest_close, 2),
-                    "regime": result.features.regime,
-                    "risk_reward": result.risk_plan.risk_reward,
-                    "reason": "; ".join(result.decision.reasons[:3]),
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        rows = [_rounded_row(result.scanner_row) for result in results]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _render_analysis(settings, symbol: str) -> None:
@@ -89,28 +80,96 @@ def _render_analysis(settings, symbol: str) -> None:
     col3.metric("Score", f"{result.decision.score:.2f}")
     col4.metric("Last Price", f"{result.snapshot.latest_close:.2f}")
 
-    st.subheader("Price")
-    st.line_chart(frame[["Close"]])
+    st.subheader("Price And Levels")
+    st.plotly_chart(_price_chart(frame, result.features.levels), use_container_width=True)
 
     st.subheader("Model Predictions")
     st.dataframe(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), use_container_width=True)
 
-    st.subheader("Signal And Risk")
-    signal_col, risk_col = st.columns(2)
-    signal_col.json(to_serializable(result.decision))
-    risk_col.json(to_serializable(result.risk_plan))
+    st.subheader("Signal")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "action": result.decision.action,
+                    "confidence": result.decision.confidence,
+                    "score": result.decision.score,
+                    "top_reason": result.decision.top_reason,
+                    "reasons": "; ".join(result.decision.reasons),
+                }
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Risk Plan")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "entry_zone": result.risk_plan.entry_zone,
+                    "entry": result.risk_plan.entry,
+                    "stop_loss": result.risk_plan.stop_loss,
+                    "targets": result.risk_plan.targets,
+                    "risk_reward": result.risk_plan.risk_reward,
+                    "position_size": result.risk_plan.position_size,
+                    "liquidity_ok": result.risk_plan.liquidity_ok,
+                    "setup_quality": result.risk_plan.setup_quality,
+                    "invalidation": result.risk_plan.invalidation,
+                }
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.subheader("Context")
     st.write(result.context.raw_summary)
+    context_metrics = {
+        "sentiment": result.context.sentiment,
+        **result.context.features,
+    }
+    st.dataframe(pd.DataFrame([context_metrics]), use_container_width=True, hide_index=True)
     if result.context.catalysts:
         st.write("Catalysts")
         st.write(result.context.catalysts)
     if result.context.risks:
         st.write("Risks")
         st.write(result.context.risks)
+    if result.context.reasons_to_trade:
+        st.write("Reasons To Trade")
+        st.write(result.context.reasons_to_trade)
+    if result.context.reasons_to_skip:
+        st.write("Reasons To Skip")
+        st.write(result.context.reasons_to_skip)
 
     st.subheader("Technical Features")
-    st.json(to_serializable(result.features))
+    st.dataframe(
+        pd.DataFrame(
+            [{"name": key, "value": value} for key, value in to_serializable(result.features.indicators).items()]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None]):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=frame.index, y=frame["Close"], mode="lines", name="Close"))
+    for name, value in levels.items():
+        if value:
+            fig.add_hline(y=float(value), annotation_text=name, line_dash="dot", opacity=0.55)
+    fig.update_layout(height=420, margin={"l": 20, "r": 20, "t": 10, "b": 20})
+    return fig
+
+
+def _rounded_row(row: dict) -> dict:
+    rounded = dict(row)
+    for key in ["price", "change_pct", "volume_anomaly", "gap_pct", "atr_pct", "confidence", "score", "risk_reward", "rank_score"]:
+        if rounded.get(key) is not None:
+            rounded[key] = round(float(rounded[key]), 4)
+    return rounded
 
 
 def _parse_args():
