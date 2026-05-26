@@ -1,0 +1,113 @@
+app:
+  name: StockPredictor Trading Intelligence
+  environment: local
+  timezone: America/Chicago
+
+data:
+  provider: yfinance
+  period: 6mo
+  interval: 1d
+  benchmark: SPY
+  min_rows: 80
+  allow_synthetic_fallback: true
+  synthetic_seed: 7
+
+watchlists:
+  default:
+    - AAPL
+    - MSFT
+    - NVDA
+    - TSLA
+    - SPY
+  day_trading:
+    - NVDA
+    - TSLA
+    - AMD
+    - META
+    - QQQ
+
+features:
+  enabled:
+    - vwap
+    - moving_averages
+    - rsi
+    - macd
+    - atr
+    - volume_anomaly
+    - volatility
+    - support_resistance
+    - gap
+    - trend
+    - market_regime
+  ma_windows: [9, 20, 50]
+  volume_window: 20
+  volatility_window: 20
+  support_resistance_window: 30
+
+models:
+  enabled:
+    - baseline
+    - gaussian_process
+    - arima
+  horizon_days: 5
+  lookback_rows: 180
+  baseline:
+    enabled: true
+  gaussian_process:
+    enabled: true
+    kernel: matern
+    max_train_rows: 160
+    n_restarts_optimizer: 0
+  arima:
+    enabled: true
+    order: [1, 1, 1]
+    max_train_rows: 220
+
+signal_fusion:
+  weights:
+    models: 0.40
+    technicals: 0.35
+    context: 0.20
+    sentiment: 0.05
+  thresholds:
+    long_score: 0.35
+    short_score: -0.35
+    watch_score: 0.18
+    min_confidence: 0.35
+    disagreement_penalty: 0.18
+
+risk:
+  account_size: 100000
+  max_risk_per_trade_pct: 0.01
+  max_position_fraction: 0.20
+  min_risk_reward: 1.5
+  atr_stop_multiple: 1.5
+  target_r_multiples: [1.5, 2.0, 3.0]
+  min_confidence_for_trade: 0.45
+  skip_if_atr_pct_above: 0.12
+
+context_agent:
+  enabled: true
+  llm_enabled: false
+  mind_file: traders.mind.md
+  sources:
+    - yfinance_news
+    - manual
+  manual_items:
+    - source: default
+      title: No configured live catalyst source returned a symbol-specific item.
+      sentiment: neutral
+      impact: 0.0
+
+backtest:
+  initial_capital: 100000
+  lookback_rows: 90
+  holding_period_days: 5
+  evaluation_step_days: 5
+  model_subset:
+    - baseline
+
+dashboard:
+  default_symbol: AAPL
+  default_watchlist: default
+  max_scan_symbols: 10
