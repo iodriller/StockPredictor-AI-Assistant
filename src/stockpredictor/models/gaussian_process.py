@@ -7,7 +7,7 @@ import pandas as pd
 
 from stockpredictor.config import Settings
 from stockpredictor.contracts import ModelPrediction
-from stockpredictor.models.base import PredictionModel, direction_from_return
+from stockpredictor.models.base import PredictionModel, direction_from_return, direction_threshold
 from stockpredictor.utils import clamp
 
 
@@ -21,7 +21,11 @@ class GaussianProcessPriceModel(PredictionModel):
 
         model_cfg = settings.models.get(self.name, {})
         horizon = int(settings.models.get("horizon_days", 5))
-        max_rows = min(int(model_cfg.get("max_train_rows", 160)), len(frame))
+        configured_rows = min(
+            int(settings.models.get("lookback_rows", model_cfg.get("max_train_rows", 160))),
+            int(model_cfg.get("max_train_rows", settings.models.get("lookback_rows", 160))),
+        )
+        max_rows = min(configured_rows, len(frame))
         close = frame["Close"].tail(max_rows).to_numpy(dtype=float).reshape(-1, 1)
         current = float(close[-1, 0])
         x_raw = np.arange(max_rows, dtype=float).reshape(-1, 1)
@@ -52,7 +56,7 @@ class GaussianProcessPriceModel(PredictionModel):
             model=self.name,
             symbol=symbol.upper(),
             horizon_days=horizon,
-            direction=direction_from_return(expected_return),
+            direction=direction_from_return(expected_return, direction_threshold(settings, horizon)),
             expected_return=float(expected_return),
             confidence=float(confidence),
             predicted_price=predicted,
@@ -60,4 +64,3 @@ class GaussianProcessPriceModel(PredictionModel):
             upper_bound=predicted + uncertainty,
             metadata={"train_rows": max_rows, "kernel": str(gp.kernel_)},
         )
-

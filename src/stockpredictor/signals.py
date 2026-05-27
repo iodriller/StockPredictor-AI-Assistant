@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .config import Settings
 from .contracts import ContextSummary, FeatureSet, ModelPrediction, SignalDecision
-from .utils import clamp, now_utc_iso
+from .utils import clamp, dedupe_preserve_order, now_in_timezone_iso
 
 
 def fuse_signals(
@@ -41,6 +41,7 @@ def fuse_signals(
     action = _action_from_score(score, confidence, thresholds)
     if action in {"no_trade", "low_confidence"}:
         reasons.append("setup is not actionable under configured thresholds")
+    deduped_reasons = dedupe_preserve_order(reasons)
 
     return SignalDecision(
         symbol=symbol.upper(),
@@ -48,12 +49,12 @@ def fuse_signals(
         confidence=confidence,
         score=score,
         timeframe=str(settings.data.get("interval", "1d")),
-        reasons=_dedupe(reasons),
+        reasons=deduped_reasons,
         model_scores=model_scores,
         feature_scores={"technicals": technical_score, "sentiment": sentiment_score},
         context_score=context_score,
-        created_at=now_utc_iso(),
-        top_reason=_dedupe(reasons)[0] if reasons else "",
+        created_at=now_in_timezone_iso(str(settings.app.get("timezone", "UTC"))),
+        top_reason=deduped_reasons[0] if deduped_reasons else "",
     )
 
 
@@ -87,13 +88,3 @@ def _normalized_weights(weights: dict[str, float]) -> dict[str, float]:
 
 def _average(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            output.append(value)
-    return output

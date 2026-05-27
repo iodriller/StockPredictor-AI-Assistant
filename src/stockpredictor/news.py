@@ -8,7 +8,7 @@ import httpx
 
 from .config import Settings
 from .context import fetch_news_items
-from .utils import clamp
+from .utils import clamp, clean_symbol_list
 
 
 CATEGORY_KEYWORDS = {
@@ -26,7 +26,7 @@ CATEGORY_KEYWORDS = {
 def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50) -> dict[str, Any]:
     cfg = settings.context_agent.get("news_analysis", {})
     max_per_symbol = int(cfg.get("max_headlines_per_symbol", 8))
-    clean_symbols = _clean_symbols(symbols)
+    clean_symbols = clean_symbol_list(symbols)
     all_items = fetch_news_items(clean_symbols, limit=max(limit, len(clean_symbols) * max_per_symbol))
     enriched = [_enrich_item(item) for item in all_items]
     grouped = {symbol: [item for item in enriched if item.get("symbol") == symbol] for symbol in clean_symbols}
@@ -110,7 +110,7 @@ def _llm_symbol_summary(symbol: str, items: list[dict[str, Any]], settings: Sett
             "impact": item.get("impact", 0),
             "category": item.get("category", "other"),
         }
-        for item in items[: int(settings.context_agent.get("news_analysis", {}).get("max_headlines_per_symbol", 8))]
+        for item in items
     ]
     try:
         if provider == "openai":
@@ -160,6 +160,7 @@ def _call_openai_responses(symbol: str, payload_items: list[dict[str, Any]], new
 def _call_openai_compatible_chat(symbol: str, payload_items: list[dict[str, Any]], news_cfg: dict[str, Any]) -> dict[str, Any]:
     base_url = os.environ.get("LOCALDEPLOY_BASE_URL") or str(news_cfg.get("base_url", "http://127.0.0.1:8100/v1/chat/completions"))
     model = os.environ.get("LOCALDEPLOY_NEWS_MODEL") or str(news_cfg.get("model", "qwen3vl_8b_ollama"))
+    provider = str(news_cfg.get("provider", "")).lower()
     body = {
         "model": model,
         "messages": [
@@ -169,9 +170,9 @@ def _call_openai_compatible_chat(symbol: str, payload_items: list[dict[str, Any]
         "temperature": float(news_cfg.get("temperature", 0.1)),
         "max_tokens": int(news_cfg.get("max_output_tokens", 700)),
         "response_format": {"type": "json_object"},
-        "safe_mode": True,
-        "timeout_seconds": float(news_cfg.get("timeout_seconds", 30)),
     }
+    if provider == "localdeploy":
+        body["safe_mode"] = True
     response = httpx.post(base_url, json=body, timeout=float(news_cfg.get("timeout_seconds", 30)) + 5)
     response.raise_for_status()
     payload = response.json()
@@ -260,18 +261,6 @@ def _no_trade_flags(items: list[dict[str, Any]]) -> list[str]:
         flags.append("sources have no clickable links")
     return flags
 
-
-def _clean_symbols(symbols: list[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for symbol in symbols:
-        clean = str(symbol).strip().upper()
-        if clean and clean not in seen:
-            seen.add(clean)
-            output.append(clean)
-    return output
-
-
 def _analysis_provider(settings: Settings) -> str:
     llm_cfg = settings.context_agent.get("news_analysis", {}).get("llm", {})
     provider = str(llm_cfg.get("provider", "heuristic")).lower()
@@ -298,7 +287,9 @@ def _extract_response_text(payload: dict[str, Any]) -> str:
 def _strip_json_fence(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
-        stripped = stripped.split("\n", 1)[-1]
+        stripped = stripped[3:].strip()
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
         if stripped.endswith("```"):
-            stripped = stripped.rsplit("```", 1)[0]
+            stripped = stripped[:-3]
     return stripped.strip()

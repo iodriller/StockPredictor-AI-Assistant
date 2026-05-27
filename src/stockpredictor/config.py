@@ -78,13 +78,7 @@ class Settings:
         return [str(symbol).upper() for symbol in symbols]
 
     def enabled_models(self) -> list[str]:
-        configured = self.models.get("enabled", [])
-        enabled: list[str] = []
-        for model_name in configured:
-            model_cfg = self.models.get(model_name, {})
-            if model_cfg.get("enabled", True):
-                enabled.append(str(model_name))
-        return enabled
+        return [str(model_name) for model_name in self.models.get("enabled", [])]
 
 
 def load_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
@@ -124,4 +118,3 @@ def _validate(raw: dict[str, Any]) -> None:
 
     if int(raw["data"].get("min_rows", 1)) <= 0:
         raise ConfigError("data.min_rows must be positive")
-

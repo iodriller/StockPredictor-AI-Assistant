@@ -6,11 +6,11 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from stockpredictor.backtesting import _simulate_exit, run_backtest
+from stockpredictor.backtesting import _excursions, _simulate_exit, run_backtest
 from stockpredictor.config import load_settings
 from stockpredictor.context import build_context_summary
 from stockpredictor.contracts import ContextSummary, FeatureSet, ModelPrediction, SignalDecision
-from stockpredictor.data import SyntheticProvider
+from stockpredictor.data import FallbackProvider, SyntheticProvider, _period_to_rows
 from stockpredictor.features import build_feature_set
 from stockpredictor.journal import append_journal_entry, load_journal_entries
 from stockpredictor.models import run_models
@@ -23,6 +23,16 @@ def test_default_config_loads() -> None:
     settings = load_settings("configs/default.example.yaml")
     assert "baseline" in settings.enabled_models()
     assert settings.watchlist()
+
+
+def test_models_enabled_list_is_the_only_disable_mechanism(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
+    raw["models"]["enabled"] = ["baseline"]
+    raw["models"]["baseline"] = {"enabled": False}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    assert load_settings(config_path).enabled_models() == ["baseline"]
 
 
 def test_synthetic_data_and_features(tmp_path: Path) -> None:
@@ -120,6 +130,7 @@ def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:
     assert plan.risk_per_share and plan.risk_per_share > 0
     assert plan.planned_risk and plan.planned_risk > 0
     assert "max_daily_loss" in plan.session_checks
+    assert len(plan.targets) == 1
 
 
 def test_risk_blocks_low_liquidity(tmp_path: Path) -> None:
@@ -135,6 +146,116 @@ def test_risk_blocks_low_liquidity(tmp_path: Path) -> None:
     assert plan.setup_quality == "low_liquidity"
 
 
+def test_risk_volume_fallback_uses_configured_window(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["features"]["volume_window"] = 3
+    raw["risk"]["min_avg_volume"] = 900
+    raw["risk"]["min_risk_reward"] = 0.1
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
+    frame["Volume"] = 0.0
+    frame.loc[frame.index[-3:], "Volume"] = 1000.0
+    latest = float(frame["Close"].iloc[-1])
+    features = build_feature_set("TEST", frame, settings)
+    indicators = {
+        **features.indicators,
+        "atr": 1.0,
+        "atr_pct": 0.01,
+        "vwap": latest,
+        "support": latest - 2,
+        "resistance": latest + 10,
+    }
+    indicators.pop("avg_volume", None)
+    features = replace(features, indicators=indicators)
+    decision = SignalDecision(symbol="TEST", action="long", confidence=0.8, score=0.7, timeframe="1d")
+
+    _, plan = apply_risk_controls(decision, features, frame, settings)
+
+    assert plan.liquidity_ok
+    assert plan.setup_quality != "low_liquidity"
+
+
+def test_no_trade_reasons_do_not_mine_decision_text(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
+    features = build_feature_set("TEST", frame, settings)
+    decision = SignalDecision(
+        symbol="TEST",
+        action="no_trade",
+        confidence=0.1,
+        score=0.0,
+        timeframe="1d",
+        reasons=["noise in model output", "took no position"],
+    )
+
+    _, plan = apply_risk_controls(decision, features, frame, settings)
+
+    assert plan.no_trade_reasons == ["fused signal is not actionable"]
+
+
+def test_risk_plan_surfaces_stop_and_target_source(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
+    features = build_feature_set("TEST", frame, settings)
+    latest = float(frame["Close"].iloc[-1])
+    features = replace(
+        features,
+        indicators={
+            **features.indicators,
+            "atr": 2.0,
+            "atr_pct": 0.02,
+            "vwap": latest - 1,
+            "support": latest - 1.5,
+            "resistance": latest + 0.5,
+            "avg_volume": 2_000_000,
+        },
+    )
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["risk"]["min_risk_reward"] = 0.05
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    decision = SignalDecision(symbol="TEST", action="long", confidence=0.8, score=0.7, timeframe="1d")
+
+    _, plan = apply_risk_controls(decision, features, frame, settings)
+
+    assert plan.stop_source in {"support", "vwap", "atr_fallback"}
+    assert plan.target_source in {"r_multiple", "structural_resistance"}
+
+
+def test_risk_long_stop_has_fallback_when_structural_levels_missing(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
+    frame.loc[frame.index[-1], "Close"] = 0.25
+    frame.loc[frame.index[-1], "Open"] = 0.25
+    frame.loc[frame.index[-1], "High"] = 0.26
+    frame.loc[frame.index[-1], "Low"] = 0.24
+    features = build_feature_set("TEST", frame, settings)
+    features = replace(
+        features,
+        indicators={
+            **features.indicators,
+            "atr": 2.0,
+            "atr_pct": 8.0,
+            "vwap": 0.0,
+            "support": 0.0,
+            "resistance": 2.0,
+            "avg_volume": 2_000_000,
+        },
+    )
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["risk"]["skip_if_atr_pct_above"] = 10
+    raw["risk"]["min_risk_reward"] = 0.1
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    decision = SignalDecision(symbol="TEST", action="long", confidence=0.8, score=0.7, timeframe="1d")
+
+    _, plan = apply_risk_controls(decision, features, frame, settings)
+
+    assert plan.stop_loss is not None
+
+
 def test_context_manual_items(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path)
     context = build_context_summary("TEST", settings, include_live_sources=False)
@@ -143,6 +264,23 @@ def test_context_manual_items(tmp_path: Path) -> None:
     assert context.catalysts
     assert context.features["catalyst_score"] > 0
     assert context.reasons_to_trade
+
+
+def test_context_summary_uses_loaded_checklist_once(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    calls = 0
+
+    def fake_load(path):
+        nonlocal calls
+        calls += 1
+        return ["check catalyst", "check risk"]
+
+    monkeypatch.setattr("stockpredictor.context._load_trader_checklist", fake_load)
+
+    context = build_context_summary("TEST", settings, include_live_sources=False)
+
+    assert calls == 1
+    assert "2 items" in context.raw_summary
 
 
 def test_context_sources_are_enforced(tmp_path: Path) -> None:
@@ -163,6 +301,8 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert analysis.snapshot.symbol == "TEST"
     assert analysis.predictions
     assert analysis.scanner_row["symbol"] == "TEST"
+    assert analysis.scanner_row["benchmark"] == "SPY"
+    assert analysis.scanner_row["relative_strength_pct"] is not None
     assert "volume_anomaly" in analysis.scanner_row
     assert "extension_from_vwap_pct" in analysis.scanner_row
     assert "liquidity_ok" in analysis.scanner_row
@@ -178,6 +318,69 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert report.evaluations > 0
     assert report.trade_log
     assert "setup_quality" in report.trade_log[0]
+
+
+def test_scan_symbols_does_not_apply_dashboard_cap(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    symbols = [f"TST{index}" for index in range(12)]
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["dashboard"]["max_scan_symbols"] = 2
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    class Result:
+        def __init__(self, symbol: str) -> None:
+            self.decision = SignalDecision(symbol=symbol, action="low_confidence", confidence=0.1, score=0.0, timeframe="1d")
+            self.scanner_row = {"rank_score": 0.0}
+
+    monkeypatch.setattr("stockpredictor.pipeline.analyze_symbol", lambda symbol, **kwargs: Result(symbol))
+
+    assert len(scan_symbols(settings, symbols=symbols)) == len(symbols)
+    assert len(scan_symbols(settings, symbols=symbols, max_symbols=2)) == 2
+
+
+def test_fallback_provider_logs_primary_failure(caplog) -> None:
+    class BrokenProvider:
+        name = "broken"
+
+        def fetch(self, symbol: str, period: str, interval: str):
+            raise RuntimeError("provider unavailable")
+
+    provider = FallbackProvider(BrokenProvider(), SyntheticProvider(), min_rows=10)
+
+    with caplog.at_level("WARNING", logger="stockpredictor.data"):
+        frame = provider.fetch("TEST", "6mo", "1d")
+
+    assert frame.attrs["provider"] == "synthetic"
+    assert "provider unavailable" in caplog.text
+
+
+def test_synthetic_intraday_row_count_respects_period() -> None:
+    assert _period_to_rows("1y", "1m") == 252 * 390
+    assert _period_to_rows("5d", "1h") == 5 * 6
+
+
+def test_trade_journal_update_and_delete(tmp_path: Path) -> None:
+    from stockpredictor.journal import delete_journal_entry, update_journal_entry
+
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["journal"] = {"enabled": True, "path": "journal.local.jsonl"}
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    record = append_journal_entry(settings, {"symbol": "test", "action": "long", "setup_type": "vwap_reclaim"})
+    entry_id = record["id"]
+    updated = update_journal_entry(settings, entry_id, {"outcome": "win", "notes": "good entry"})
+
+    assert updated and updated["outcome"] == "win"
+    assert updated["notes"] == "good entry"
+    assert updated["id"] == entry_id
+    assert load_journal_entries(settings)[-1]["outcome"] == "win"
+
+    assert delete_journal_entry(settings, entry_id) is True
+    assert load_journal_entries(settings) == []
+    assert delete_journal_entry(settings, entry_id) is False
 
 
 def test_trade_journal_roundtrip(tmp_path: Path) -> None:
@@ -216,17 +419,60 @@ def test_backtest_exit_simulation_paths() -> None:
     assert _simulate_exit("long", time_window, stop_loss=95, target=110)[1] == "time_exit"
 
 
+def test_backtest_session_guard_stops_after_consecutive_losses(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["risk"]["stop_after_consecutive_losses"] = 1
+    raw["risk"]["max_trades_per_day"] = 0
+    raw["risk"]["max_daily_loss_pct"] = 0
+    raw["backtest"]["evaluation_step_days"] = 5
+    raw["backtest"]["lookback_rows"] = 70
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    from stockpredictor.contracts import AnalysisResult, FeatureSet, MarketSnapshot, RiskPlan, SignalDecision
+    from stockpredictor.data import SyntheticProvider
+
+    def fake_analyze(symbol, settings=None, provider=None, model_names=None, data_frame=None, include_context=True):
+        return AnalysisResult(
+            snapshot=MarketSnapshot(symbol=symbol, as_of="t", timeframe="1d", provider="synthetic", rows=80, latest_close=100.0, latest_volume=1_000_000),
+            features=FeatureSet(symbol=symbol, as_of="t", latest_price=100.0),
+            predictions=[],
+            context=__import__("stockpredictor.contracts", fromlist=["ContextSummary"]).ContextSummary(symbol=symbol, enabled=False, score=0.0, sentiment="neutral"),
+            decision=SignalDecision(symbol=symbol, action="long", confidence=0.9, score=0.7, timeframe="1d"),
+            risk_plan=RiskPlan(symbol=symbol, action="long", entry=100.0, stop_loss=95.0, targets=[110.0], risk_per_share=5.0, position_size=10, planned_risk=50.0, planned_position_value=1000.0, risk_reward=2.0),
+        )
+
+    monkeypatch.setattr("stockpredictor.backtesting.analyze_symbol", fake_analyze)
+
+    # Force every trade to lose by making the future window dip below the stop.
+    monkeypatch.setattr("stockpredictor.backtesting._simulate_exit", lambda action, window, stop_loss, target: (stop_loss, "stop_hit", "2026-01-01"))
+
+    report = run_backtest(settings, symbols=["AAA"], provider=SyntheticProvider())
+    blocked = [row for row in report.trade_log if row.get("exit_reason") == "session_blocked"]
+    assert blocked, "expected at least one session-blocked entry once consecutive losses hit the limit"
+
+
+def test_excursions_use_entry_denominator() -> None:
+    index = pd.date_range("2026-01-01", periods=2, freq="D")
+    window = pd.DataFrame({"High": [110, 108], "Low": [90, 95]}, index=index)
+
+    long_mae, long_mfe = _excursions("long", window, entry=100)
+    short_mae, short_mfe = _excursions("short", window, entry=100)
+
+    assert long_mae == 0.1
+    assert long_mfe == 0.1
+    assert short_mae == 0.1
+    assert short_mfe == 0.1
+
+
 def _test_settings(tmp_path: Path, enabled_models: list[str] | None = None):
     raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
     raw["data"]["provider"] = "synthetic"
     raw["data"]["min_rows"] = 60
     raw["models"]["enabled"] = enabled_models or ["baseline"]
-    for model_name in ["baseline", "gaussian_process", "arima"]:
-        if model_name in raw["models"]:
-            raw["models"][model_name]["enabled"] = model_name in raw["models"]["enabled"]
     raw["models"]["lookback_rows"] = 80
     raw["models"]["gaussian_process"]["max_train_rows"] = 55
-    raw["models"]["arima"]["enabled"] = "arima" in raw["models"]["enabled"]
     raw["context_agent"]["sources"] = ["manual"]
     raw["context_agent"]["manual_items"] = [
         {

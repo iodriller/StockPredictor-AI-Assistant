@@ -5,7 +5,7 @@ import pandas as pd
 
 from stockpredictor.config import Settings
 from stockpredictor.contracts import ModelPrediction
-from stockpredictor.models.base import PredictionModel, direction_from_return
+from stockpredictor.models.base import PredictionModel, direction_from_return, direction_threshold
 from stockpredictor.utils import clamp
 
 
@@ -29,7 +29,7 @@ class BaselineTrendModel(PredictionModel):
             model=self.name,
             symbol=symbol.upper(),
             horizon_days=horizon,
-            direction=direction_from_return(expected_return),
+            direction=direction_from_return(expected_return, direction_threshold(settings, horizon)),
             expected_return=float(expected_return),
             confidence=float(confidence),
             predicted_price=predicted,

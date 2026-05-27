@@ -132,12 +132,12 @@ def technical_score(latest_price: float, indicators: dict[str, float | str | Non
     score = 0.0
     reasons: list[str] = []
 
-    sma_9 = _num(indicators.get("sma_9"))
-    sma_20 = _num(indicators.get("sma_20"))
-    vwap = _num(indicators.get("vwap"))
-    rsi = _num(indicators.get("rsi"))
-    macd_hist = _num(indicators.get("macd_hist"))
-    volume_anomaly = _num(indicators.get("volume_anomaly"), 1.0)
+    sma_9 = to_float(indicators.get("sma_9"))
+    sma_20 = to_float(indicators.get("sma_20"))
+    vwap = to_float(indicators.get("vwap"))
+    rsi = to_float(indicators.get("rsi"))
+    macd_hist = to_float(indicators.get("macd_hist"))
+    volume_anomaly = to_float(indicators.get("volume_anomaly"), 1.0)
     trend = str(indicators.get("trend") or "mixed")
 
     if trend == "uptrend":
@@ -223,9 +223,9 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
 
 
 def _trend_label(latest_close: float, indicators: dict[str, float | str | None]) -> str:
-    sma_9 = _num(indicators.get("sma_9"))
-    sma_20 = _num(indicators.get("sma_20"))
-    sma_50 = _num(indicators.get("sma_50"))
+    sma_9 = to_float(indicators.get("sma_9"))
+    sma_20 = to_float(indicators.get("sma_20"))
+    sma_50 = to_float(indicators.get("sma_50"))
     if latest_close > sma_9 > sma_20 and (not sma_50 or sma_20 > sma_50):
         return "uptrend"
     if latest_close < sma_9 < sma_20 and (not sma_50 or sma_20 < sma_50):
@@ -234,7 +234,7 @@ def _trend_label(latest_close: float, indicators: dict[str, float | str | None])
 
 
 def _market_regime(indicators: dict[str, float | str | None]) -> str:
-    volatility = _num(indicators.get("volatility"))
+    volatility = to_float(indicators.get("volatility"))
     trend = str(indicators.get("trend") or "mixed")
     high_vol = volatility > 0.03
     if trend in {"uptrend", "downtrend"} and high_vol:
@@ -261,12 +261,3 @@ def _opening_range_levels(frame: pd.DataFrame, minutes: int = 30) -> tuple[float
     if opening.empty:
         return None, None, "unavailable"
     return to_float(opening["High"].max(), None), to_float(opening["Low"].min(), None), "available"
-
-
-def _num(value: object, default: float = 0.0) -> float:
-    try:
-        if value is None or pd.isna(value):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default

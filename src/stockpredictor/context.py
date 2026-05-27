@@ -3,9 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import logging
+
 from .config import Settings
 from .contracts import ContextSummary
-from .utils import clamp
+from .utils import TTLCache, clamp, dedupe_preserve_order
+
+
+LOGGER = logging.getLogger(__name__)
+_NEWS_CACHE = TTLCache(ttl_seconds=120)
 
 
 POSITIVE_WORDS = {"beat", "beats", "raise", "raises", "upgrade", "growth", "approval", "strong", "record", "deal", "guidance"}
@@ -32,7 +38,7 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     if "manual" in sources:
         items.extend(cfg.get("manual_items", []))
     if include_live_sources and "yfinance_news" in sources:
-        items.extend(fetch_news_items([symbol], limit=5))
+        items.extend(fetch_news_items([symbol], limit=int(cfg.get("news_limit", 8))))
 
     catalysts: list[str] = []
     risks: list[str] = []
@@ -62,9 +68,20 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
 
     catalyst_score = clamp(sum(score_parts) / len(score_parts), -1.0, 1.0) if score_parts else 0.0
     catalyst_freshness = clamp(sum(freshness_parts) / len(freshness_parts), 0.0, 1.0) if freshness_parts else 0.0
+    market_alignment_present = any(part != 0 for part in market_alignment_parts)
+    sector_alignment_present = any(part != 0 for part in sector_alignment_parts)
     market_alignment = clamp(sum(market_alignment_parts) / len(market_alignment_parts), -1.0, 1.0) if market_alignment_parts else 0.0
     sector_alignment = clamp(sum(sector_alignment_parts) / len(sector_alignment_parts), -1.0, 1.0) if sector_alignment_parts else 0.0
-    score = clamp((catalyst_score * 0.65) + (market_alignment * 0.20) + (sector_alignment * 0.15), -1.0, 1.0)
+    # Re-normalize: when an alignment input is absent (provider didn't supply it),
+    # roll its weight back into catalyst_score so the context score isn't silently
+    # diluted by inert weights.
+    weights = {"catalyst": 0.65, "market": 0.20 if market_alignment_present else 0.0, "sector": 0.15 if sector_alignment_present else 0.0}
+    total_weight = sum(weights.values()) or 1.0
+    score = clamp(
+        ((catalyst_score * weights["catalyst"]) + (market_alignment * weights["market"]) + (sector_alignment * weights["sector"])) / total_weight,
+        -1.0,
+        1.0,
+    )
     sentiment = "bullish" if score > 0.15 else "bearish" if score < -0.15 else "neutral"
     if not catalysts:
         reasons_to_skip.append("no strong configured catalyst")
@@ -91,29 +108,34 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             "market_alignment": market_alignment,
             "sector_alignment": sector_alignment,
             "checklist_items": float(len(checklist)),
-            "llm_enabled": bool(cfg.get("llm_enabled", False)),
+            "news_llm_enabled": bool(cfg.get("news_analysis", {}).get("llm", {}).get("enabled", False)),
         },
-        reasons_to_trade=_dedupe(reasons_to_trade)[:8],
-        reasons_to_skip=_dedupe(reasons_to_skip)[:8],
+        reasons_to_trade=dedupe_preserve_order(reasons_to_trade)[:8],
+        reasons_to_skip=dedupe_preserve_order(reasons_to_skip)[:8],
     )
 
 
 def fetch_news_items(symbols: list[str], limit: int = 25) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for symbol in symbols:
-        items.extend(_yfinance_news(symbol))
+        items.extend(_yfinance_news(symbol, limit=limit))
     return items[:limit]
 
 
-def _yfinance_news(symbol: str) -> list[dict[str, Any]]:
+def _yfinance_news(symbol: str, limit: int = 25) -> list[dict[str, Any]]:
+    cache_key = ("yfinance_news", symbol.upper(), limit)
+    cached = _NEWS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
     try:
         import yfinance as yf
 
         news = yf.Ticker(symbol).news or []
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("yfinance news fetch failed for %s: %s", symbol, exc)
         return []
     items = []
-    for entry in news[:5]:
+    for entry in news[:limit]:
         content = entry.get("content", entry) if isinstance(entry, dict) else {}
         title = content.get("title") or entry.get("title") if isinstance(entry, dict) else ""
         link = ""
@@ -141,6 +163,7 @@ def _yfinance_news(symbol: str) -> list[dict[str, Any]]:
                     "sentiment": "bullish" if impact > 0.15 else "bearish" if impact < -0.15 else "neutral",
                 }
             )
+    _NEWS_CACHE.set(cache_key, list(items))
     return items
 
 
@@ -178,29 +201,26 @@ def _resolve_mind_file(settings: Settings, mind_file: str) -> Path:
 def _load_trader_checklist(mind_file: Path) -> list[str]:
     if not mind_file.exists():
         return []
-    lines = mind_file.read_text(encoding="utf-8").splitlines()
-    return [line[2:].strip() for line in lines if line.startswith("- ") and line[2:].strip()]
+    items: list[str] = []
+    for line in mind_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        marker = stripped[:2]
+        if marker in {"- ", "* ", "+ "}:
+            content = stripped[2:].strip()
+            if content:
+                items.append(content)
+    return items
 
 
 def _summarize_context(symbol: str, catalysts: list[str], risks: list[str], mind_file: Path, checklist: list[str]) -> str:
-    checklist = "trader checklist unavailable"
-    if mind_file.exists():
-        checklist = f"trader checklist loaded with {len(_load_trader_checklist(mind_file))} items"
+    checklist_summary = f"trader checklist loaded with {len(checklist)} items" if checklist else "trader checklist unavailable"
     if catalysts or risks:
-        parts = [f"{symbol.upper()} context summary ({checklist})."]
+        parts = [f"{symbol.upper()} context summary ({checklist_summary})."]
         if catalysts:
             parts.append("Catalysts: " + "; ".join(catalysts[:3]))
         if risks:
             parts.append("Risks: " + "; ".join(risks[:3]))
         return " ".join(parts)
-    return f"{symbol.upper()} has no strong configured catalyst. {checklist}; default to price, volume, levels, and risk controls."
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            output.append(value)
-    return output
+    return f"{symbol.upper()} has no strong configured catalyst. {checklist_summary}; default to price, volume, levels, and risk controls."

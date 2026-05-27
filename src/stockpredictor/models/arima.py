@@ -6,7 +6,7 @@ import pandas as pd
 
 from stockpredictor.config import Settings
 from stockpredictor.contracts import ModelPrediction
-from stockpredictor.models.base import PredictionModel, direction_from_return
+from stockpredictor.models.base import PredictionModel, direction_from_return, direction_threshold
 from stockpredictor.utils import clamp
 
 
@@ -19,7 +19,11 @@ class ArimaPriceModel(PredictionModel):
         model_cfg = settings.models.get(self.name, {})
         order = tuple(int(value) for value in model_cfg.get("order", [1, 1, 1]))
         horizon = int(settings.models.get("horizon_days", 5))
-        max_rows = min(int(model_cfg.get("max_train_rows", 220)), len(frame))
+        configured_rows = min(
+            int(settings.models.get("lookback_rows", model_cfg.get("max_train_rows", 220))),
+            int(model_cfg.get("max_train_rows", settings.models.get("lookback_rows", 220))),
+        )
+        max_rows = min(configured_rows, len(frame))
         close = frame["Close"].tail(max_rows).astype(float)
         current = float(close.iloc[-1])
         with warnings.catch_warnings():
@@ -34,7 +38,7 @@ class ArimaPriceModel(PredictionModel):
             model=self.name,
             symbol=symbol.upper(),
             horizon_days=horizon,
-            direction=direction_from_return(expected_return),
+            direction=direction_from_return(expected_return, direction_threshold(settings, horizon)),
             expected_return=float(expected_return),
             confidence=float(confidence),
             predicted_price=predicted,
@@ -42,4 +46,3 @@ class ArimaPriceModel(PredictionModel):
             upper_bound=predicted + residual_std,
             metadata={"order": order, "train_rows": max_rows},
         )
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from typing import Protocol
 
 import numpy as np
@@ -9,7 +10,11 @@ import pandas as pd
 
 from .config import Settings
 from .contracts import MarketSnapshot
-from .utils import to_float
+from .utils import TTLCache, to_float
+
+
+LOGGER = logging.getLogger(__name__)
+_MARKET_DATA_CACHE = TTLCache(ttl_seconds=300)
 
 
 class MarketDataProvider(Protocol):
@@ -46,7 +51,10 @@ class SyntheticProvider:
         rows = _period_to_rows(period, interval)
         stable_symbol_seed = sum((idx + 1) * ord(char) for idx, char in enumerate(symbol.upper()))
         rng = np.random.default_rng(self.seed + stable_symbol_seed)
-        index = pd.date_range(end=pd.Timestamp.now(tz="UTC").normalize(), periods=rows, freq="B")
+        interval_minutes = _interval_to_minutes(interval.lower())
+        freq = f"{interval_minutes}min" if interval_minutes is not None else "B"
+        end = pd.Timestamp.now(tz="UTC").floor(freq) if interval_minutes is not None else pd.Timestamp.now(tz="UTC").normalize()
+        index = pd.date_range(end=end, periods=rows, freq=freq)
         drift = 0.0008 + (stable_symbol_seed % 9) / 10000
         shocks = rng.normal(drift, 0.018, rows)
         close = 100 * np.exp(np.cumsum(shocks))
@@ -80,8 +88,22 @@ class FallbackProvider:
             if len(frame) >= self.min_rows:
                 frame.attrs["provider"] = self.primary.name
                 return frame
-        except Exception:
-            pass
+            LOGGER.warning(
+                "Primary market data provider %s returned %s rows for %s; minimum is %s. Falling back to %s.",
+                self.primary.name,
+                len(frame),
+                symbol.upper(),
+                self.min_rows,
+                self.fallback.name,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Primary market data provider %s failed for %s. Falling back to %s: %s",
+                self.primary.name,
+                symbol.upper(),
+                self.fallback.name,
+                exc,
+            )
         frame = self.fallback.fetch(symbol, period, interval)
         frame.attrs["provider"] = self.fallback.name
         return frame
@@ -104,14 +126,21 @@ def get_market_data_provider(settings: Settings) -> MarketDataProvider:
 
 def fetch_market_data(symbol: str, settings: Settings, provider: MarketDataProvider | None = None) -> pd.DataFrame:
     provider = provider or get_market_data_provider(settings)
-    frame = provider.fetch(
-        symbol.upper(),
-        period=str(settings.data.get("period", "6mo")),
-        interval=str(settings.data.get("interval", "1d")),
-    )
+    period = str(settings.data.get("period", "6mo"))
+    interval = str(settings.data.get("interval", "1d"))
+    cache_ttl = float(settings.data.get("cache_ttl_seconds", 0) or 0)
+    cache_key = (getattr(provider, "name", "provider"), symbol.upper(), period, interval)
+    if cache_ttl > 0:
+        _MARKET_DATA_CACHE.ttl_seconds = cache_ttl
+        cached = _MARKET_DATA_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+    frame = provider.fetch(symbol.upper(), period=period, interval=interval)
     min_rows = int(settings.data.get("min_rows", 80))
     if len(frame) < min_rows:
         raise ValueError(f"{symbol.upper()} returned {len(frame)} rows; minimum is {min_rows}")
+    if cache_ttl > 0:
+        _MARKET_DATA_CACHE.set(cache_key, frame.copy())
     return frame
 
 
@@ -155,12 +184,32 @@ def normalize_ohlcv(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
 def _period_to_rows(period: str, interval: str) -> int:
     period = period.lower()
     interval = interval.lower()
-    if interval.endswith("m") or interval.endswith("h"):
-        return 390
+    trading_days = _period_to_trading_days(period)
+    minutes = _interval_to_minutes(interval)
+    if minutes is not None:
+        return max(30, trading_days * max(1, 390 // minutes))
+    if interval.endswith("wk"):
+        interval_weeks = int(interval[:-2] or 1)
+        return max(4, trading_days // max(1, interval_weeks * 5))
+    if interval.endswith("d"):
+        interval_days = int(interval[:-1] or 1)
+        return max(30, trading_days // max(1, interval_days))
+    return max(60, trading_days)
+
+
+def _period_to_trading_days(period: str) -> int:
     if period.endswith("y"):
-        return max(120, int(period[:-1] or 1) * 252)
+        return max(1, int(period[:-1] or 1) * 252)
     if period.endswith("mo"):
-        return max(60, int(period[:-2] or 6) * 21)
+        return max(1, int(period[:-2] or 6) * 21)
     if period.endswith("d"):
-        return max(30, int(period[:-1] or 30))
+        return max(1, int(period[:-1] or 30))
     return 180
+
+
+def _interval_to_minutes(interval: str) -> int | None:
+    if interval.endswith("m"):
+        return max(1, int(interval[:-1] or 1))
+    if interval.endswith("h"):
+        return max(1, int(interval[:-1] or 1) * 60)
+    return None

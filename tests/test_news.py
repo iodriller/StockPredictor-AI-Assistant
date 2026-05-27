@@ -5,7 +5,8 @@ from pathlib import Path
 import yaml
 
 from stockpredictor.config import load_settings
-from stockpredictor.news import build_news_feed
+from stockpredictor.context import fetch_news_items
+from stockpredictor.news import _call_openai_compatible_chat, _strip_json_fence, build_news_feed
 
 
 def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch) -> None:
@@ -79,6 +80,51 @@ def test_news_feed_can_use_localdeploy_llm(tmp_path: Path, monkeypatch) -> None:
     assert feed["summaries"][0]["analysis_provider"] == "localdeploy"
     assert feed["summaries"][0]["grand_summary"] == "LLM summary"
     assert feed["summaries"][0]["day_trader_focus"]["catalyst"] == "AI contract"
+
+
+def test_fetch_news_items_passes_limit_to_provider(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.context._yfinance_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "title": str(index)} for index in range(limit)],
+    )
+
+    assert len(fetch_news_items(["TEST"], limit=8)) == 8
+
+
+def test_strip_json_fence_handles_single_line_fence() -> None:
+    assert _strip_json_fence('```json{"ok": true}```') == '{"ok": true}'
+    assert _strip_json_fence('```\n{"ok": true}\n```') == '{"ok": true}'
+
+
+def test_openai_compatible_body_omits_localdeploy_extensions(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"grand_summary":"ok","day_trader_focus":{}}'}}]}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("stockpredictor.news.httpx.post", fake_post)
+
+    _call_openai_compatible_chat(
+        "TEST",
+        [{"title": "TEST wins contract"}],
+        {
+            "provider": "openai_compatible",
+            "base_url": "http://example.test/v1/chat/completions",
+            "model": "fixture",
+            "timeout_seconds": 5,
+        },
+    )
+
+    assert "safe_mode" not in captured
+    assert "timeout_seconds" not in captured
 
 
 def _settings(tmp_path: Path):

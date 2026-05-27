@@ -14,7 +14,6 @@ from .utils import to_serializable
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="stockpredictor")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
     subparsers = parser.add_subparsers(dest="command", required=True)

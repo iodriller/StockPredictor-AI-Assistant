@@ -19,7 +19,8 @@ def apply_risk_controls(
     latest_price = to_float(frame["Close"].iloc[-1])
     atr = to_float(features.indicators.get("atr"), latest_price * 0.02)
     atr_pct = to_float(features.indicators.get("atr_pct"), atr / latest_price if latest_price else 0.0)
-    avg_volume = to_float(features.indicators.get("avg_volume"), frame["Volume"].tail(20).mean())
+    volume_window = int(settings.features.get("volume_window", 20))
+    avg_volume = to_float(features.indicators.get("avg_volume"), frame["Volume"].tail(volume_window).mean())
     vwap = to_float(features.indicators.get("vwap"), 0.0)
     support = to_float(features.indicators.get("support"), 0.0)
     resistance = to_float(features.indicators.get("resistance"), 0.0)
@@ -38,7 +39,7 @@ def apply_risk_controls(
             liquidity_ok=avg_volume >= float(risk_cfg.get("min_avg_volume", 0)),
             setup_quality="not_actionable",
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(decision, ["fused signal is not actionable"]),
+            no_trade_reasons=_no_trade_reasons(["fused signal is not actionable"]),
         )
 
     if decision.confidence < float(risk_cfg.get("min_confidence_for_trade", 0.45)):
@@ -54,7 +55,7 @@ def apply_risk_controls(
             liquidity_ok=avg_volume >= float(risk_cfg.get("min_avg_volume", 0)),
             setup_quality="low_confidence",
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["confidence below trade threshold"]),
+            no_trade_reasons=_no_trade_reasons(["confidence below trade threshold"]),
         )
 
     min_avg_volume = float(risk_cfg.get("min_avg_volume", 0))
@@ -71,7 +72,7 @@ def apply_risk_controls(
             liquidity_ok=False,
             setup_quality="low_liquidity",
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["liquidity below configured minimum"]),
+            no_trade_reasons=_no_trade_reasons(["liquidity below configured minimum"]),
         )
 
     if atr_pct > float(risk_cfg.get("skip_if_atr_pct_above", 0.12)):
@@ -87,7 +88,7 @@ def apply_risk_controls(
             liquidity_ok=True,
             setup_quality="too_volatile",
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["volatility above configured maximum"]),
+            no_trade_reasons=_no_trade_reasons(["volatility above configured maximum"]),
         )
 
     max_vwap_distance = float(risk_cfg.get("max_entry_distance_from_vwap_pct", 1.0))
@@ -104,27 +105,38 @@ def apply_risk_controls(
             liquidity_ok=True,
             setup_quality="extended",
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["price too extended from VWAP"]),
+            no_trade_reasons=_no_trade_reasons(["price too extended from VWAP"]),
         )
 
     entry = latest_price
     entry_zone = _entry_zone(latest_price, atr, decision.action)
     stop_distance = max(atr * float(risk_cfg.get("atr_stop_multiple", 1.5)), entry * 0.003)
     if decision.action == "long":
-        structural_stop = max(value for value in [support, vwap, entry - stop_distance] if value > 0 and value < entry)
+        fallback_stop = max(entry - stop_distance, entry * 0.01)
+        structural_stop, stop_source = _best_long_stop(
+            {"support": support, "vwap": vwap, "atr_fallback": fallback_stop},
+            entry,
+            fallback_stop,
+        )
         stop_loss = min(entry - entry * 0.003, structural_stop - atr * 0.20)
-        raw_targets = [entry + abs(entry - stop_loss) * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
-        targets = _merge_structural_target(raw_targets, resistance, long=True)
+        raw_target = entry + abs(entry - stop_loss) * _primary_target_multiple(risk_cfg)
+        targets, target_source = _merge_structural_target(raw_target, resistance, long=True)
         invalidation = "Long idea is invalid below stop loss, nearby support, or sustained loss of VWAP."
     else:
-        structural_stop = min(value for value in [resistance, vwap, entry + stop_distance] if value > entry)
+        fallback_stop = entry + stop_distance
+        structural_stop, stop_source = _best_short_stop(
+            {"resistance": resistance, "vwap": vwap, "atr_fallback": fallback_stop},
+            entry,
+            fallback_stop,
+        )
         stop_loss = max(entry + entry * 0.003, structural_stop + atr * 0.20)
-        raw_targets = [entry - abs(entry - stop_loss) * float(mult) for mult in risk_cfg.get("target_r_multiples", [1.5, 2.0, 3.0])]
-        targets = _merge_structural_target(raw_targets, support, long=False)
+        raw_target = entry - abs(entry - stop_loss) * _primary_target_multiple(risk_cfg)
+        targets, target_source = _merge_structural_target(raw_target, support, long=False)
         invalidation = "Short idea is invalid above stop loss, nearby resistance, or sustained reclaim of VWAP."
 
     risk_reward = abs(targets[0] - entry) / abs(entry - stop_loss)
     risk_per_share = abs(entry - stop_loss)
+    notes.append(f"Stop anchored on {stop_source}; target anchored on {target_source}.")
     if risk_reward < float(risk_cfg.get("min_risk_reward", 1.5)):
         adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: risk/reward too low"])
         return adjusted, RiskPlan(
@@ -141,7 +153,11 @@ def apply_risk_controls(
             setup_quality="poor_risk_reward",
             risk_per_share=risk_per_share,
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["risk/reward below configured minimum"]),
+            no_trade_reasons=_no_trade_reasons(
+                [f"risk/reward below configured minimum (stop anchored on {stop_source})"]
+            ),
+            stop_source=stop_source,
+            target_source=target_source,
         )
 
     account_size = float(risk_cfg.get("account_size", 100000))
@@ -167,7 +183,9 @@ def apply_risk_controls(
             setup_quality="invalid_position_size",
             risk_per_share=risk_per_share,
             session_checks=session_checks,
-            no_trade_reasons=_no_trade_reasons(adjusted, ["position size below one share"]),
+            no_trade_reasons=_no_trade_reasons(["position size below one share"]),
+            stop_source=stop_source,
+            target_source=target_source,
         )
 
     planned_risk = position_size * risk_per_share
@@ -195,6 +213,8 @@ def apply_risk_controls(
         planned_position_value=planned_position_value,
         session_checks=session_checks,
         no_trade_reasons=[],
+        stop_source=stop_source,
+        target_source=target_source,
     )
 
 
@@ -207,15 +227,39 @@ def _entry_zone(price: float, atr: float, action: str) -> tuple[float, float] | 
     return (price - cushion * 0.5, price + cushion)
 
 
-def _merge_structural_target(raw_targets: list[float], structural_level: float, long: bool) -> list[float]:
+def _merge_structural_target(raw_target: float, structural_level: float, long: bool) -> tuple[list[float], str]:
     if not structural_level:
-        return raw_targets
-    first = raw_targets[0]
-    if long and structural_level > first:
-        raw_targets[0] = structural_level
-    if not long and 0 < structural_level < first:
-        raw_targets[0] = structural_level
-    return raw_targets
+        return [raw_target], "r_multiple"
+    if long and 0 < structural_level < raw_target:
+        return [structural_level], "structural_resistance"
+    if not long and structural_level > raw_target > 0:
+        return [structural_level], "structural_support"
+    return [raw_target], "r_multiple"
+
+
+def _primary_target_multiple(risk_cfg: dict) -> float:
+    if "target_r_multiple" in risk_cfg:
+        return float(risk_cfg["target_r_multiple"])
+    configured = risk_cfg.get("target_r_multiples", [1.5])
+    if not configured:
+        return 1.5
+    return float(configured[0])
+
+
+def _best_long_stop(candidates: dict[str, float], entry: float, fallback: float) -> tuple[float, str]:
+    valid = [(name, value) for name, value in candidates.items() if value > 0 and value < entry]
+    if not valid:
+        return fallback, "atr_fallback"
+    name, value = max(valid, key=lambda item: item[1])
+    return value, name
+
+
+def _best_short_stop(candidates: dict[str, float], entry: float, fallback: float) -> tuple[float, str]:
+    valid = [(name, value) for name, value in candidates.items() if value > entry]
+    if not valid:
+        return fallback, "atr_fallback"
+    name, value = min(valid, key=lambda item: item[1])
+    return value, name
 
 
 def _session_checks(settings: Settings, avg_volume: float) -> dict[str, float | int | bool | str]:
@@ -245,9 +289,7 @@ def _session_note(session_checks: dict[str, float | int | bool | str]) -> str:
     )
 
 
-def _no_trade_reasons(decision: SignalDecision, extra: list[str]) -> list[str]:
-    reasons = list(extra)
-    reasons.extend(reason for reason in decision.reasons if "blocked" in reason or "no " in reason.lower() or "too " in reason.lower())
+def _no_trade_reasons(reasons: list[str]) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
     for reason in reasons:

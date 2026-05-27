@@ -93,6 +93,8 @@ class RiskPlan:
     planned_position_value: float | None = None
     session_checks: dict[str, float | int | bool | str] = field(default_factory=dict)
     no_trade_reasons: list[str] = field(default_factory=list)
+    stop_source: str = ""
+    target_source: str = ""
 
 
 @dataclass

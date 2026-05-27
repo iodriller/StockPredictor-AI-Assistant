@@ -5,7 +5,12 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
+import stockpredictor.api as api_module
 from stockpredictor.api import create_app
+
+
+def test_api_module_does_not_create_app_at_import() -> None:
+    assert not hasattr(api_module, "app")
 
 
 def test_api_health_config_and_analyze(tmp_path: Path, monkeypatch) -> None:
@@ -41,6 +46,10 @@ def test_api_health_config_and_analyze(tmp_path: Path, monkeypatch) -> None:
     assert news.status_code == 200
     assert news.json()["summaries"][0]["grand_summary"] == "Test summary"
 
+    analysis_get = client.get("/analyze/TEST")
+    assert analysis_get.status_code == 200
+    assert analysis_get.json()["snapshot"]["symbol"] == "TEST"
+
     analysis = client.post("/analyze/TEST")
     assert analysis.status_code == 200
     assert analysis.json()["snapshot"]["symbol"] == "TEST"
@@ -54,6 +63,19 @@ def test_api_health_config_and_analyze(tmp_path: Path, monkeypatch) -> None:
     scan = client.post("/scan", json={"symbols": ["TEST"]})
     assert scan.status_code == 200
     assert scan.json()[0]["scanner_row"]["symbol"] == "TEST"
+
+    scan_get = client.get("/scan?symbols=TEST")
+    assert scan_get.status_code == 200
+    assert scan_get.json()[0]["scanner_row"]["symbol"] == "TEST"
+
+    session_analysis = client.post("/analyze/TEST", json={"session_id": "alpha"})
+    assert session_analysis.status_code == 200
+    alpha_latest = client.get("/signals/latest?session_id=alpha")
+    assert alpha_latest.status_code == 200
+    assert alpha_latest.json()[0]["snapshot"]["symbol"] == "TEST"
+    missing_latest = client.get("/signals/latest?session_id=missing")
+    assert missing_latest.status_code == 200
+    assert missing_latest.json() == []
 
     backtest = client.post("/backtest", json={"symbols": ["TEST"]})
     assert backtest.status_code == 200

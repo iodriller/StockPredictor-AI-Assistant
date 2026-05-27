@@ -23,3 +23,12 @@ def direction_from_return(expected_return: float, threshold: float = 0.0025) -> 
         return "down"
     return "flat"
 
+
+def direction_threshold(settings: Settings, horizon_days: int) -> float:
+    models_cfg = settings.models
+    explicit = models_cfg.get("direction_threshold_pct")
+    if explicit is not None:
+        return float(explicit)
+    per_day = float(models_cfg.get("direction_threshold_per_day_pct", 0.0005))
+    return per_day * max(1, int(horizon_days))
+

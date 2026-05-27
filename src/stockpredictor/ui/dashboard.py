@@ -11,11 +11,16 @@ import streamlit as st
 from stockpredictor.backtesting import run_backtest
 from stockpredictor.config import ConfigError, load_settings
 from stockpredictor.data import fetch_market_data, get_market_data_provider
-from stockpredictor.journal import append_journal_entry, load_journal_entries
+from stockpredictor.journal import (
+    append_journal_entry,
+    delete_journal_entry,
+    load_journal_entries,
+    update_journal_entry,
+)
 from stockpredictor.news import build_news_feed
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.symbols import normalize_symbol, search_symbols
-from stockpredictor.utils import to_serializable
+from stockpredictor.utils import clean_symbol_list, to_serializable
 
 
 def main() -> None:
@@ -75,8 +80,14 @@ def main() -> None:
 def _render_scanner(settings, symbols: list[str]) -> None:
     st.subheader("Scanner")
     st.caption("Ranks the selected symbols by movement, volume, signal confidence, catalyst/risk flags, and setup quality.")
+    if settings.raw.get("scanner", {}).get("intraday_provider_note", False):
+        st.caption("Provider note: premarket high/low, spread, float, halt status, and time-of-day RVOL require a dedicated intraday scanner provider.")
     if st.button("Run Scan", type="primary"):
-        results = scan_symbols(settings, symbols=symbols or None)
+        results = scan_symbols(
+            settings,
+            symbols=symbols or None,
+            max_symbols=int(settings.dashboard.get("max_scan_symbols", len(symbols) if symbols else len(settings.watchlist()))),
+        )
         rows = [_rounded_row(result.scanner_row) for result in results]
         if not rows:
             st.info("No symbols selected.")
@@ -107,7 +118,10 @@ def _render_analysis(settings, symbol: str) -> None:
     col4.metric("Last Price", _format_price(result.snapshot.latest_close), _format_percent(result.snapshot.change_pct))
 
     st.subheader("Price And Levels")
-    st.plotly_chart(_price_chart(frame, result.features.levels, result.risk_plan), use_container_width=True)
+    st.plotly_chart(
+        _price_chart(frame, result.features.levels, result.risk_plan, ma_windows=settings.features.get("ma_windows", [9, 20, 50])),
+        use_container_width=True,
+    )
 
     st.subheader("Model Predictions")
     model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
@@ -177,7 +191,7 @@ def _render_analysis(settings, symbol: str) -> None:
     )
 
 
-def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan=None):
+def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan=None, ma_windows: list[int] | None = None):
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -197,17 +211,13 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
         row=1,
         col=1,
     )
-    for window in [9, 20, 50]:
+    for window in [int(value) for value in (ma_windows or [])]:
         column = f"sma_{window}"
         if len(frame) >= window:
             fig.add_trace(go.Scatter(x=frame.index, y=frame["Close"].rolling(window).mean(), mode="lines", name=column.upper()), row=1, col=1)
     if "Volume" in frame:
         fig.add_trace(go.Bar(x=frame.index, y=frame["Volume"], name="Volume", marker_color="#8892a6"), row=2, col=1)
     chart_levels = dict(levels)
-    if len(frame) >= 2:
-        chart_levels["prior_high"] = float(frame["High"].iloc[-2])
-        chart_levels["prior_low"] = float(frame["Low"].iloc[-2])
-    chart_levels["session_open"] = float(frame["Open"].iloc[-1])
     for name, value in chart_levels.items():
         if value:
             fig.add_hline(y=float(value), annotation_text=f"{name}: {_format_price(float(value))}", line_dash="dot", opacity=0.55, row=1, col=1)
@@ -227,7 +237,7 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
             fig.add_hline(y=float(risk_plan.entry), annotation_text=f"entry: {_format_price(risk_plan.entry)}", line_color="#2f80ed", row=1, col=1)
         if risk_plan.stop_loss:
             fig.add_hline(y=float(risk_plan.stop_loss), annotation_text=f"stop: {_format_price(risk_plan.stop_loss)}", line_color="#d64545", row=1, col=1)
-        for index, target in enumerate(risk_plan.targets[:3], start=1):
+        for index, target in enumerate(risk_plan.targets, start=1):
             fig.add_hline(y=float(target), annotation_text=f"target {index}: {_format_price(target)}", line_color="#1f9d55", row=1, col=1)
     fig.update_layout(height=560, margin={"l": 20, "r": 20, "t": 10, "b": 20}, xaxis_rangeslider_visible=False)
     return fig
@@ -236,6 +246,7 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
 def _render_scanner_filters(df: pd.DataFrame, settings) -> pd.DataFrame:
     defaults = settings.raw.get("scanner", {}).get("default_filters", {})
     with st.expander("Scanner Filters", expanded=False):
+        st.caption("Min abs change and Max ATR are in percent. Min RVOL is the volume ratio (1.0 = average).")
         c1, c2, c3, c4 = st.columns(4)
         min_abs_change = c1.slider("Min abs change", 0.0, 20.0, float(defaults.get("min_abs_change_pct", 0.0)) * 100, 0.5, format="%.1f%%")
         min_rvol = c2.slider("Min RVOL", 0.0, 10.0, float(defaults.get("min_volume_anomaly", 0.0)), 0.25)
@@ -259,7 +270,9 @@ def _risk_plan_row(plan) -> dict:
         "entry_zone": _format_price_range(plan.entry_zone),
         "entry": plan.entry,
         "stop_loss": plan.stop_loss,
+        "stop_source": plan.stop_source or "-",
         "targets": _format_targets(plan.targets),
+        "target_source": plan.target_source or "-",
         "risk_reward": plan.risk_reward,
         "risk_per_share": plan.risk_per_share,
         "max_position_risk": plan.max_position_risk,
@@ -362,13 +375,13 @@ def _render_symbol_sidebar(settings) -> list[str]:
         height=96,
         placeholder="AAPL, NVDA, PLTR, SOFI",
     )
-    symbols = _dedupe_symbols(_parse_symbols(st.session_state.selected_symbols_text))
+    symbols = clean_symbol_list(_parse_symbols(st.session_state.selected_symbols_text))
     st.sidebar.caption(f"{len(symbols)} selected: {', '.join(symbols[:8])}{'...' if len(symbols) > 8 else ''}")
     return symbols
 
 
 def _append_symbol_to_state(symbol: str) -> None:
-    symbols = _dedupe_symbols(_parse_symbols(st.session_state.get("selected_symbols_text", "")) + [symbol])
+    symbols = clean_symbol_list(_parse_symbols(st.session_state.get("selected_symbols_text", "")) + [symbol])
     st.session_state.selected_symbols_text = ", ".join(symbols)
 
 
@@ -450,6 +463,12 @@ def _render_symbol_news_summary(summary: dict) -> None:
             )
 
 
+_JOURNAL_SETUPS = ["opening_range_break", "vwap_reclaim", "vwap_loss", "trend_pullback", "gap_and_go", "reversal", "news_catalyst", "other"]
+_JOURNAL_ACTIONS = ["long", "short", "watch", "no_trade", "low_confidence"]
+_JOURNAL_OUTCOMES = ["open", "win", "loss", "breakeven", "skipped"]
+_JOURNAL_STATES = ["calm", "neutral", "hesitant", "rushed", "revenge", "overconfident"]
+
+
 def _render_journal(settings, symbols: list[str]) -> None:
     st.subheader("Trade Review Journal")
     st.caption("Local JSONL journal for reviewing setup quality, risk discipline, and outcome. This stays out of Git by default.")
@@ -457,15 +476,15 @@ def _render_journal(settings, symbols: list[str]) -> None:
     with st.form("journal_form"):
         c1, c2, c3, c4 = st.columns(4)
         symbol = c1.text_input("Symbol", value=(symbols[0] if symbols else str(settings.dashboard.get("default_symbol", "AAPL")))).upper()
-        action = c2.selectbox("Action", ["long", "short", "watch", "no_trade", "low_confidence"])
-        setup_type = c3.selectbox("Setup", ["opening_range_break", "vwap_reclaim", "vwap_loss", "trend_pullback", "gap_and_go", "reversal", "news_catalyst", "other"])
-        outcome = c4.selectbox("Outcome", ["open", "win", "loss", "breakeven", "skipped"])
+        action = c2.selectbox("Action", _JOURNAL_ACTIONS)
+        setup_type = c3.selectbox("Setup", _JOURNAL_SETUPS)
+        outcome = c4.selectbox("Outcome", _JOURNAL_OUTCOMES)
         c5, c6, c7, c8 = st.columns(4)
         followed_plan = c5.checkbox("Followed plan")
         risk_respected = c6.checkbox("Risk respected")
         entry_quality = c7.slider("Entry quality", 1, 5, 3)
         exit_quality = c8.slider("Exit quality", 1, 5, 3)
-        emotional_state = st.selectbox("State", ["calm", "neutral", "hesitant", "rushed", "revenge", "overconfident"])
+        emotional_state = st.selectbox("State", _JOURNAL_STATES)
         notes = st.text_area("Notes")
         submitted = st.form_submit_button("Save Review")
     if submitted:
@@ -489,13 +508,78 @@ def _render_journal(settings, symbols: list[str]) -> None:
     if recent:
         df = pd.DataFrame(recent)
         st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+        _render_journal_edit_controls(settings, recent)
     else:
         st.info("No journal entries yet.")
 
 
+def _render_journal_edit_controls(settings, recent: list[dict]) -> None:
+    with st.expander("Edit or delete an entry"):
+        rows_with_ids = [row for row in recent if row.get("id")]
+        if not rows_with_ids:
+            st.caption("Older entries do not have IDs yet. Save a new entry to start tracking edits.")
+            return
+        options = {f"{row['id'][:8]}  {row['timestamp']}  {row['symbol']}  ({row.get('action', '')})": row for row in rows_with_ids}
+        selected_label = st.selectbox("Entry", list(options.keys()))
+        selected = options[selected_label]
+        with st.form(f"journal_edit_{selected['id']}"):
+            updates_symbol = st.text_input("Symbol", value=selected.get("symbol", "")).upper()
+            updates_action = st.selectbox(
+                "Action",
+                _JOURNAL_ACTIONS,
+                index=_safe_index(_JOURNAL_ACTIONS, selected.get("action", "watch")),
+            )
+            updates_outcome = st.selectbox(
+                "Outcome",
+                _JOURNAL_OUTCOMES,
+                index=_safe_index(_JOURNAL_OUTCOMES, selected.get("outcome", "open")),
+            )
+            updates_notes = st.text_area("Notes", value=str(selected.get("notes", "")))
+            col_save, col_delete = st.columns(2)
+            save = col_save.form_submit_button("Save edit")
+            delete = col_delete.form_submit_button("Delete entry")
+        if save:
+            updated = update_journal_entry(
+                settings,
+                selected["id"],
+                {
+                    "symbol": updates_symbol,
+                    "action": updates_action,
+                    "outcome": updates_outcome,
+                    "notes": updates_notes,
+                },
+            )
+            if updated:
+                st.success(f"Updated entry {selected['id'][:8]}.")
+            else:
+                st.error("Entry not found; reload the dashboard.")
+        if delete:
+            if delete_journal_entry(settings, selected["id"]):
+                st.success(f"Deleted entry {selected['id'][:8]}.")
+            else:
+                st.error("Entry not found; reload the dashboard.")
+
+
+def _safe_index(options: list[str], value: str) -> int:
+    try:
+        return options.index(value)
+    except ValueError:
+        return 0
+
+
 def _rounded_row(row: dict) -> dict:
     rounded = dict(row)
-    percent_keys = {"change_pct", "gap_pct", "atr_pct", "confidence", "extension_from_vwap_pct", "distance_to_support_pct", "distance_to_resistance_pct"}
+    percent_keys = {
+        "change_pct",
+        "gap_pct",
+        "atr_pct",
+        "confidence",
+        "extension_from_vwap_pct",
+        "distance_to_support_pct",
+        "distance_to_resistance_pct",
+        "benchmark_change_pct",
+        "relative_strength_pct",
+    }
     for key in [
         "price",
         "change_pct",
@@ -514,6 +598,8 @@ def _rounded_row(row: dict) -> dict:
         "extension_from_vwap_pct",
         "distance_to_support_pct",
         "distance_to_resistance_pct",
+        "benchmark_change_pct",
+        "relative_strength_pct",
     ]:
         if rounded.get(key) is not None:
             value = float(rounded[key])
@@ -525,18 +611,6 @@ def _rounded_row(row: dict) -> dict:
 
 def _parse_symbols(value: str) -> list[str]:
     return [normalize_symbol(part) for part in value.replace("\n", ",").split(",") if part.strip()]
-
-
-def _dedupe_symbols(symbols: list[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for symbol in symbols:
-        clean = symbol.strip().upper()
-        if clean and clean not in seen:
-            seen.add(clean)
-            output.append(clean)
-    return output
-
 
 def _format_price(value: float | None) -> str:
     return "-" if value is None else f"${float(value):,.2f}"
@@ -561,6 +635,8 @@ def _scanner_column_config() -> dict:
         "extension_from_vwap_pct": st.column_config.NumberColumn("VWAP Dist", format="%.2f%%"),
         "distance_to_support_pct": st.column_config.NumberColumn("Support Dist", format="%.2f%%"),
         "distance_to_resistance_pct": st.column_config.NumberColumn("Resistance Dist", format="%.2f%%"),
+        "benchmark_change_pct": st.column_config.NumberColumn("Benchmark", format="%.2f%%"),
+        "relative_strength_pct": st.column_config.NumberColumn("Rel Strength", format="%.2f%%"),
         "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
         "score": st.column_config.NumberColumn("Score", format="%.3f"),
         "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
@@ -582,6 +658,8 @@ def _risk_column_config() -> dict:
     return {
         "entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
         "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f"),
+        "stop_source": st.column_config.TextColumn("Stop anchor"),
+        "target_source": st.column_config.TextColumn("Target anchor"),
         "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
         "risk_per_share": st.column_config.NumberColumn("Risk/Share", format="$%.2f"),
         "planned_risk": st.column_config.NumberColumn("Planned Risk", format="$%.2f"),
