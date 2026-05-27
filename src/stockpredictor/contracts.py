@@ -88,6 +88,11 @@ class RiskPlan:
     entry_zone: tuple[float, float] | None = None
     liquidity_ok: bool = True
     setup_quality: str = "unknown"
+    risk_per_share: float | None = None
+    planned_risk: float | None = None
+    planned_position_value: float | None = None
+    session_checks: dict[str, float | int | bool | str] = field(default_factory=dict)
+    no_trade_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass

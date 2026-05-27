@@ -19,6 +19,11 @@ def build_feature_set(symbol: str, frame: pd.DataFrame, settings: Settings) -> F
         "vwap": indicators.get("vwap"),
         "sma_20": indicators.get("sma_20"),
         "sma_50": indicators.get("sma_50"),
+        "prior_high": indicators.get("prior_high"),
+        "prior_low": indicators.get("prior_low"),
+        "session_open": indicators.get("session_open"),
+        "opening_range_high": indicators.get("opening_range_high"),
+        "opening_range_low": indicators.get("opening_range_low"),
     }
     regime = str(indicators.get("market_regime") or "unknown")
     score, reasons = technical_score(latest_price, indicators)
@@ -97,6 +102,24 @@ def calculate_indicators(frame: pd.DataFrame, settings: Settings) -> dict[str, f
     if "gap" in enabled:
         gap_pct = (open_ - previous_close) / previous_close
         latest_values["gap_pct"] = to_float(gap_pct.iloc[-1], 0.0)
+
+    if "session_levels" in enabled:
+        latest_values["session_open"] = to_float(open_.iloc[-1], None)
+        latest_values["session_high"] = to_float(high.iloc[-1], None)
+        latest_values["session_low"] = to_float(low.iloc[-1], None)
+        if len(frame) >= 2:
+            latest_values["prior_high"] = to_float(high.iloc[-2], None)
+            latest_values["prior_low"] = to_float(low.iloc[-2], None)
+            latest_values["prior_close"] = to_float(close.iloc[-2], None)
+
+    if "opening_range" in enabled:
+        opening_high, opening_low, opening_status = _opening_range_levels(
+            frame,
+            minutes=int(features_cfg.get("opening_range_minutes", 30)),
+        )
+        latest_values["opening_range_high"] = opening_high
+        latest_values["opening_range_low"] = opening_low
+        latest_values["opening_range_status"] = opening_status
 
     if "trend" in enabled:
         latest_values["trend"] = _trend_label(close.iloc[-1], latest_values)
@@ -221,6 +244,23 @@ def _market_regime(indicators: dict[str, float | str | None]) -> str:
     if high_vol:
         return "choppy_high_volatility"
     return "choppy"
+
+
+def _opening_range_levels(frame: pd.DataFrame, minutes: int = 30) -> tuple[float | None, float | None, str]:
+    if not isinstance(frame.index, pd.DatetimeIndex) or len(frame) < 2:
+        return None, None, "unavailable"
+
+    latest_day = frame.index[-1].date()
+    session = frame[frame.index.date == latest_day]
+    if len(session) < 2:
+        return None, None, "requires_intraday_data"
+
+    start = session.index[0]
+    cutoff = start + pd.Timedelta(minutes=max(1, minutes))
+    opening = session[session.index <= cutoff]
+    if opening.empty:
+        return None, None, "unavailable"
+    return to_float(opening["High"].max(), None), to_float(opening["Low"].min(), None), "available"
 
 
 def _num(value: object, default: float = 0.0) -> float:

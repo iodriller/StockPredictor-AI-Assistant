@@ -63,12 +63,18 @@ def run_backtest(
                         "action": result.decision.action,
                         "exit_reason": "no_trade",
                         "return": 0.0,
+                        "confidence": result.decision.confidence,
+                        "score": result.decision.score,
+                        "setup_quality": plan.setup_quality,
+                        "top_reason": result.decision.top_reason,
+                        "skip_reasons": "; ".join(plan.no_trade_reasons),
                         "equity": equity,
                     }
                 )
                 continue
             future_window = frame.iloc[index + 1 : index + holding + 1]
             exit_price, exit_reason, exit_date = _simulate_exit(result.decision.action, future_window, plan.stop_loss, plan.targets[0])
+            mae, mfe = _excursions(result.decision.action, future_window, current_close)
             if exit_price is None:
                 exit_price = future_close
                 exit_reason = "time_exit"
@@ -79,6 +85,8 @@ def run_backtest(
                 trade_return = (exit_price / entry) - 1
             else:
                 trade_return = (entry / exit_price) - 1
+            risk_per_share = plan.risk_per_share or abs(entry - plan.stop_loss)
+            r_multiple = ((exit_price - entry) if result.decision.action == "long" else (entry - exit_price)) / risk_per_share if risk_per_share else 0.0
             position_fraction = float(settings.risk.get("max_position_fraction", 0.20))
             position_value = equity * position_fraction
             commission_return = commission / position_value if position_value else 0.0
@@ -98,9 +106,17 @@ def run_backtest(
                     "exit_date": exit_date,
                     "exit_reason": exit_reason,
                     "return": portfolio_return,
+                    "trade_return": trade_return,
+                    "r_multiple": r_multiple,
+                    "max_adverse_excursion": mae,
+                    "max_favorable_excursion": mfe,
                     "confidence": result.decision.confidence,
                     "score": result.decision.score,
                     "risk_reward": plan.risk_reward or 0.0,
+                    "planned_risk": plan.planned_risk or 0.0,
+                    "position_size": plan.position_size or 0,
+                    "setup_quality": plan.setup_quality,
+                    "top_reason": result.decision.top_reason,
                     "equity": equity,
                 }
             )
@@ -164,3 +180,15 @@ def _simulate_exit(action: str, window: pd.DataFrame, stop_loss: float, target: 
             if low <= target:
                 return target, "target_hit", date_text
     return None, "time_exit", ""
+
+
+def _excursions(action: str, window: pd.DataFrame, entry: float) -> tuple[float, float]:
+    if window.empty or entry <= 0:
+        return 0.0, 0.0
+    if action == "short":
+        adverse = ((window["High"] / entry) - 1).max()
+        favorable = ((entry / window["Low"]) - 1).max()
+    else:
+        adverse = ((entry / window["Low"]) - 1).max()
+        favorable = ((window["High"] / entry) - 1).max()
+    return float(max(adverse, 0.0)), float(max(favorable, 0.0))

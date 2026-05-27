@@ -37,12 +37,15 @@ features:
     - volatility
     - support_resistance
     - gap
+    - session_levels
+    - opening_range
     - trend
     - market_regime
   ma_windows: [9, 20, 50]
   volume_window: 20
   volatility_window: 20
   support_resistance_window: 30
+  opening_range_minutes: 30
 
 models:
   enabled:
@@ -87,6 +90,22 @@ risk:
   skip_if_atr_pct_above: 0.12
   min_avg_volume: 500000
   max_entry_distance_from_vwap_pct: 0.08
+  max_daily_loss_pct: 0.03
+  max_trades_per_day: 5
+  stop_after_consecutive_losses: 3
+  pdt_warning_enabled: true
+  pdt_min_equity: 25000
+
+scanner:
+  default_filters:
+    min_abs_change_pct: 0.0
+    min_volume_anomaly: 0.0
+    max_atr_pct: 0.50
+  intraday_provider_note: true
+
+journal:
+  enabled: true
+  path: data/trade_journal.local.jsonl
 
 context_agent:
   enabled: true

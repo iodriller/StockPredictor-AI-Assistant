@@ -31,20 +31,23 @@ workflow sources. It is research and product planning, not financial advice.
 
 - Search and discovery was watchlist-bound. The dashboard needs symbol lookup,
   arbitrary ticker entry, and eventually true market-wide scans.
-- Scanner lacks real intraday filters such as premarket gap, opening range high
-  and low, relative volume by time of day, spread, float, halts, and high-of-day
-  momentum.
-- News is not yet a first-class workflow. A trader needs a news feed with
-  symbols, timestamps, source, sentiment, catalyst category, and summary.
-- Charts need day-trader overlays: candles, volume, VWAP, 9/20/50 EMA or SMA,
-  prior day high/low, premarket high/low, opening range, support/resistance, and
-  planned entry/stop/target.
-- Risk needs session controls: max daily loss, max trades, stop after
-  consecutive losses, position sizing by stop distance, and account/PDT warning.
-- Context needs better classification: catalyst type, freshness, credibility,
-  sector sympathy, macro relevance, and headline importance.
-- Backtesting needs intraday data, strategy-specific rules, session filters,
-  slippage/spread assumptions, and review tags.
+- Scanner now has trader-facing ranking and filters. True market-wide and
+  tick-level intraday filters still need a dedicated intraday data provider for
+  premarket, spread, float, halt, and high-of-day momentum coverage.
+- News is now a first-class workflow with per-symbol summaries, source links,
+  sentiment, impact, category, and local LLM support.
+- Charts now show candles, volume, VWAP/moving averages, session/prior levels,
+  opening-range availability, and risk-plan overlays for entry, stop, targets,
+  and entry zone.
+- Risk now includes session guardrails: max daily loss, max trades, consecutive
+  loss stop, PDT warning, stop-distance sizing, planned risk, and no-trade
+  reasons.
+- Context now classifies catalyst categories, impact, sentiment, source count,
+  headline relevance, and day-trader focus. Credibility scoring is still basic
+  because free providers do not expose source reliability metadata.
+- Backtesting now records stop/target/time exits, slippage/commission, R
+  multiple, MAE/MFE, setup quality, top reason, and no-trade logs. True intraday
+  strategy testing still needs intraday bars.
 
 ## Priority Build Plan
 
@@ -73,28 +76,37 @@ workflow sources. It is research and product planning, not financial advice.
    - Use formatted percentages, prices, and rank score.
    - Status: first polish pass implemented with formatted table, movement/RVOL
      metrics, catalyst/risk flags, selected-symbol workflow, and rank score.
-   - Later: add true intraday scans: premarket gap >2%, RVOL >2, average volume
-     >1M, spread filter, opening range break, VWAP reclaim/loss.
+   - Status update: added scanner filters, VWAP distance, support/resistance
+     distance, prior/session/opening-range fields, liquidity flag, high-RVOL
+     flag, meaningful-gap flag, and skip reasons.
+   - Provider-limited later item: add true market-wide intraday scans with
+     premarket gap >2%, time-of-day RVOL, spread filter, float, halts, opening
+     range break, VWAP reclaim/loss, and high-of-day momentum.
 
 4. **Chart polish**
    - Replace line chart with candlestick chart plus volume.
    - Overlay moving averages and key levels.
    - Status: first polish pass implemented with candlesticks, volume, moving
      averages, VWAP, prior high/low, session open, support, and resistance.
-   - Later: add premarket high/low, opening range, entry, stop, targets, and
-     risk box.
+   - Status update: added opening-range overlay when intraday bars are available
+     and risk overlays for entry zone, entry, stop, and targets.
+   - Provider-limited later item: add premarket high/low once the selected data
+     provider supplies premarket bars.
 
 5. **Risk and checklist panel**
    - Show the trade plan without raw JSON.
    - Include entry zone, stop, targets, position size, max risk, risk/reward,
      invalidation, setup quality, and no-trade reason.
-   - Later: add max daily loss, max trades/day, consecutive-loss stop, PDT
-     warning, and journal prompt.
+   - Status: implemented with planned risk, position value, risk/share, session
+     guardrails, PDT warning, and no-trade reasons.
 
 6. **Review and journal**
    - Add trade-review fields: setup type, followed plan, emotional state,
      entry quality, exit quality, and screenshot/link.
-   - Later: use journal results to score which setups are working.
+   - Status: implemented as a local JSONL journal with dashboard and API
+     create/list endpoints.
+   - Later: add screenshot/link upload and use journal results to score which
+     setups are working.
 
 ## Acceptance Criteria For The Next Increment
 
@@ -106,6 +118,9 @@ workflow sources. It is research and product planning, not financial advice.
 - News tab shows recent headlines for selected tickers.
 - Dashboard still runs locally through the project `.venv`.
 - API includes symbol search and news endpoints.
+- API includes local journal endpoints.
+- Backtest trade log includes setup quality, R multiple, MAE/MFE, and skip
+  reasons.
 
 ## News Feed Target Behavior
 

@@ -12,6 +12,7 @@ from stockpredictor.context import build_context_summary
 from stockpredictor.contracts import ContextSummary, FeatureSet, ModelPrediction, SignalDecision
 from stockpredictor.data import SyntheticProvider
 from stockpredictor.features import build_feature_set
+from stockpredictor.journal import append_journal_entry, load_journal_entries
 from stockpredictor.models import run_models
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.risk import apply_risk_controls
@@ -19,7 +20,7 @@ from stockpredictor.signals import fuse_signals
 
 
 def test_default_config_loads() -> None:
-    settings = load_settings("configs/default.yaml")
+    settings = load_settings("configs/default.example.yaml")
     assert "baseline" in settings.enabled_models()
     assert settings.watchlist()
 
@@ -116,6 +117,9 @@ def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:
     assert plan.entry_zone is not None
     assert plan.liquidity_ok
     assert plan.setup_quality == "actionable"
+    assert plan.risk_per_share and plan.risk_per_share > 0
+    assert plan.planned_risk and plan.planned_risk > 0
+    assert "max_daily_loss" in plan.session_checks
 
 
 def test_risk_blocks_low_liquidity(tmp_path: Path) -> None:
@@ -160,6 +164,8 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert analysis.predictions
     assert analysis.scanner_row["symbol"] == "TEST"
     assert "volume_anomaly" in analysis.scanner_row
+    assert "extension_from_vwap_pct" in analysis.scanner_row
+    assert "liquidity_ok" in analysis.scanner_row
 
     scan = scan_symbols(settings, symbols=["AAA", "BBB"], provider=provider)
     assert len(scan) == 2
@@ -171,6 +177,33 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert 0 <= report.no_trade_rate <= 1
     assert report.evaluations > 0
     assert report.trade_log
+    assert "setup_quality" in report.trade_log[0]
+
+
+def test_trade_journal_roundtrip(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["journal"] = {"enabled": True, "path": "journal.local.jsonl"}
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    record = append_journal_entry(
+        settings,
+        {
+            "symbol": "test",
+            "action": "long",
+            "setup_type": "vwap_reclaim",
+            "followed_plan": True,
+            "risk_respected": True,
+            "entry_quality": 4,
+            "exit_quality": 3,
+            "outcome": "win",
+        },
+    )
+    entries = load_journal_entries(settings)
+
+    assert record["symbol"] == "TEST"
+    assert entries[-1]["setup_type"] == "vwap_reclaim"
 
 
 def test_backtest_exit_simulation_paths() -> None:
@@ -184,7 +217,7 @@ def test_backtest_exit_simulation_paths() -> None:
 
 
 def _test_settings(tmp_path: Path, enabled_models: list[str] | None = None):
-    raw = yaml.safe_load(Path("configs/default.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
     raw["data"]["provider"] = "synthetic"
     raw["data"]["min_rows"] = 60
     raw["models"]["enabled"] = enabled_models or ["baseline"]

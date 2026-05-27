@@ -82,7 +82,7 @@ def test_news_feed_can_use_localdeploy_llm(tmp_path: Path, monkeypatch) -> None:
 
 
 def _settings(tmp_path: Path):
-    raw = yaml.safe_load(Path("configs/default.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
     raw["data"]["provider"] = "synthetic"
     raw["context_agent"]["news_analysis"]["llm"]["enabled"] = False
     config_path = tmp_path / "news_config.yaml"

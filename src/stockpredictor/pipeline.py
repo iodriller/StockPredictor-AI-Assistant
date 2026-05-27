@@ -70,15 +70,26 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
     volume_anomaly = features.indicators.get("volume_anomaly")
     gap_pct = features.indicators.get("gap_pct")
     atr_pct = features.indicators.get("atr_pct")
+    vwap = features.indicators.get("vwap")
+    support = features.indicators.get("support")
+    resistance = features.indicators.get("resistance")
     risk_reward = risk_plan.risk_reward
     catalyst_flag = bool(context.catalysts)
     risk_flag = bool(context.risks or context.reasons_to_skip)
+    extension_from_vwap_pct = _pct_distance(snapshot.latest_close, vwap)
+    distance_to_support_pct = _pct_distance(snapshot.latest_close, support)
+    distance_to_resistance_pct = _pct_distance(snapshot.latest_close, resistance)
+    high_relative_volume = bool(float(volume_anomaly or 0.0) >= 1.5)
+    meaningful_gap = bool(abs(float(gap_pct or 0.0)) >= 0.02)
+    vwap_alignment = _vwap_alignment(snapshot.latest_close, vwap)
     rank_score = (
         abs(decision.score) * 0.45
         + decision.confidence * 0.30
         + abs(float(snapshot.change_pct)) * 4.0
         + max(float(volume_anomaly or 1.0) - 1.0, 0.0) * 0.10
+        + abs(float(gap_pct or 0.0)) * 1.5
         + (0.08 if catalyst_flag else 0.0)
+        + (0.05 if high_relative_volume else 0.0)
         - (0.08 if risk_flag and decision.action in {"long", "short"} else 0.0)
     )
     return {
@@ -90,6 +101,19 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
         "volume_anomaly": float(volume_anomaly) if volume_anomaly is not None else None,
         "gap_pct": float(gap_pct) if gap_pct is not None else None,
         "atr_pct": float(atr_pct) if atr_pct is not None else None,
+        "prior_high": _float_or_none(features.indicators.get("prior_high")),
+        "prior_low": _float_or_none(features.indicators.get("prior_low")),
+        "session_open": _float_or_none(features.indicators.get("session_open")),
+        "opening_range_high": _float_or_none(features.indicators.get("opening_range_high")),
+        "opening_range_low": _float_or_none(features.indicators.get("opening_range_low")),
+        "opening_range_status": str(features.indicators.get("opening_range_status", "")),
+        "extension_from_vwap_pct": extension_from_vwap_pct,
+        "distance_to_support_pct": distance_to_support_pct,
+        "distance_to_resistance_pct": distance_to_resistance_pct,
+        "liquidity_ok": risk_plan.liquidity_ok,
+        "high_relative_volume": high_relative_volume,
+        "meaningful_gap": meaningful_gap,
+        "vwap_alignment": vwap_alignment,
         "regime": features.regime,
         "trend": str(features.indicators.get("trend", "unknown")),
         "action": decision.action,
@@ -101,4 +125,32 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
         "top_reason": decision.top_reason or (decision.reasons[0] if decision.reasons else ""),
         "rank_score": rank_score,
         "setup_quality": risk_plan.setup_quality,
+        "skip_reasons": "; ".join(risk_plan.no_trade_reasons),
     }
+
+
+def _pct_distance(price: float, level: object) -> float | None:
+    try:
+        if level is None or float(level) == 0:
+            return None
+        return (float(price) / float(level)) - 1
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vwap_alignment(price: float, vwap: object) -> str:
+    distance = _pct_distance(price, vwap)
+    if distance is None:
+        return "unknown"
+    if abs(distance) <= 0.002:
+        return "at_vwap"
+    return "above_vwap" if distance > 0 else "below_vwap"

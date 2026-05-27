@@ -11,6 +11,7 @@ import streamlit as st
 from stockpredictor.backtesting import run_backtest
 from stockpredictor.config import ConfigError, load_settings
 from stockpredictor.data import fetch_market_data, get_market_data_provider
+from stockpredictor.journal import append_journal_entry, load_journal_entries
 from stockpredictor.news import build_news_feed
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.symbols import normalize_symbol, search_symbols
@@ -32,7 +33,9 @@ def main() -> None:
 
     symbols = _render_symbol_sidebar(settings)
 
-    scan_tab, deep_dive_tab, news_tab, backtest_tab, config_tab = st.tabs(["Scanner", "Ticker Deep Dive", "News Feed", "Backtest", "Config"])
+    scan_tab, deep_dive_tab, news_tab, backtest_tab, journal_tab, config_tab = st.tabs(
+        ["Scanner", "Ticker Deep Dive", "News Feed", "Backtest", "Journal", "Config"]
+    )
     with scan_tab:
         _render_scanner(settings, symbols)
     with deep_dive_tab:
@@ -58,8 +61,13 @@ def main() -> None:
                 st.line_chart(equity_df.set_index("date")["equity"])
             if report.trade_log:
                 st.subheader("Trade Log")
-                trade_log_df = _percent_display(pd.DataFrame(report.trade_log), ["return", "confidence"])
+                trade_log_df = _percent_display(
+                    pd.DataFrame(report.trade_log),
+                    ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
+                )
                 st.dataframe(trade_log_df, use_container_width=True, hide_index=True, column_config=_trade_log_column_config())
+    with journal_tab:
+        _render_journal(settings, symbols)
     with config_tab:
         st.json(to_serializable(settings.raw))
 
@@ -74,6 +82,10 @@ def _render_scanner(settings, symbols: list[str]) -> None:
             st.info("No symbols selected.")
             return
         df = pd.DataFrame(rows)
+        df = _render_scanner_filters(df, settings)
+        if df.empty:
+            st.info("No symbols passed the current scanner filters.")
+            return
         actionable = int(df["action"].isin(["long", "short", "watch"]).sum()) if "action" in df else 0
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Scanned", len(df))
@@ -95,7 +107,7 @@ def _render_analysis(settings, symbol: str) -> None:
     col4.metric("Last Price", _format_price(result.snapshot.latest_close), _format_percent(result.snapshot.change_pct))
 
     st.subheader("Price And Levels")
-    st.plotly_chart(_price_chart(frame, result.features.levels), use_container_width=True)
+    st.plotly_chart(_price_chart(frame, result.features.levels, result.risk_plan), use_container_width=True)
 
     st.subheader("Model Predictions")
     model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
@@ -124,25 +136,15 @@ def _render_analysis(settings, symbol: str) -> None:
 
     st.subheader("Risk Plan")
     st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "entry_zone": result.risk_plan.entry_zone,
-                    "entry": result.risk_plan.entry,
-                    "stop_loss": result.risk_plan.stop_loss,
-                    "targets": result.risk_plan.targets,
-                    "risk_reward": result.risk_plan.risk_reward,
-                    "position_size": result.risk_plan.position_size,
-                    "liquidity_ok": result.risk_plan.liquidity_ok,
-                    "setup_quality": result.risk_plan.setup_quality,
-                    "invalidation": result.risk_plan.invalidation,
-                }
-            ]
-        ),
+        pd.DataFrame([_risk_plan_row(result.risk_plan)]),
         use_container_width=True,
         hide_index=True,
         column_config=_risk_column_config(),
     )
+    if result.risk_plan.session_checks:
+        st.caption(_session_check_text(result.risk_plan.session_checks))
+    if result.risk_plan.no_trade_reasons:
+        st.warning("No-trade reasons: " + "; ".join(result.risk_plan.no_trade_reasons))
 
     st.subheader("Context")
     st.write(result.context.raw_summary)
@@ -168,14 +170,14 @@ def _render_analysis(settings, symbol: str) -> None:
     st.subheader("Technical Features")
     st.dataframe(
         pd.DataFrame(
-            [{"name": key, "value": value} for key, value in to_serializable(result.features.indicators).items()]
+            _indicator_rows(to_serializable(result.features.indicators))
         ),
         use_container_width=True,
         hide_index=True,
     )
 
 
-def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None]):
+def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan=None):
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -209,8 +211,117 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None]):
     for name, value in chart_levels.items():
         if value:
             fig.add_hline(y=float(value), annotation_text=f"{name}: {_format_price(float(value))}", line_dash="dot", opacity=0.55, row=1, col=1)
+    if risk_plan is not None:
+        if risk_plan.entry_zone:
+            fig.add_hrect(
+                y0=float(risk_plan.entry_zone[0]),
+                y1=float(risk_plan.entry_zone[1]),
+                fillcolor="#2f80ed",
+                opacity=0.10,
+                line_width=0,
+                annotation_text="entry zone",
+                row=1,
+                col=1,
+            )
+        if risk_plan.entry:
+            fig.add_hline(y=float(risk_plan.entry), annotation_text=f"entry: {_format_price(risk_plan.entry)}", line_color="#2f80ed", row=1, col=1)
+        if risk_plan.stop_loss:
+            fig.add_hline(y=float(risk_plan.stop_loss), annotation_text=f"stop: {_format_price(risk_plan.stop_loss)}", line_color="#d64545", row=1, col=1)
+        for index, target in enumerate(risk_plan.targets[:3], start=1):
+            fig.add_hline(y=float(target), annotation_text=f"target {index}: {_format_price(target)}", line_color="#1f9d55", row=1, col=1)
     fig.update_layout(height=560, margin={"l": 20, "r": 20, "t": 10, "b": 20}, xaxis_rangeslider_visible=False)
     return fig
+
+
+def _render_scanner_filters(df: pd.DataFrame, settings) -> pd.DataFrame:
+    defaults = settings.raw.get("scanner", {}).get("default_filters", {})
+    with st.expander("Scanner Filters", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        min_abs_change = c1.slider("Min abs change", 0.0, 20.0, float(defaults.get("min_abs_change_pct", 0.0)) * 100, 0.5, format="%.1f%%")
+        min_rvol = c2.slider("Min RVOL", 0.0, 10.0, float(defaults.get("min_volume_anomaly", 0.0)), 0.25)
+        max_atr = c3.slider("Max ATR", 0.0, 50.0, float(defaults.get("max_atr_pct", 0.50)) * 100, 1.0, format="%.0f%%")
+        actions = sorted(df["action"].dropna().unique().tolist()) if "action" in df else []
+        selected_actions = c4.multiselect("Actions", actions, default=actions)
+    filtered = df.copy()
+    if "change_pct" in filtered:
+        filtered = filtered[filtered["change_pct"].abs() >= min_abs_change]
+    if "volume_anomaly" in filtered:
+        filtered = filtered[filtered["volume_anomaly"].fillna(0) >= min_rvol]
+    if "atr_pct" in filtered:
+        filtered = filtered[filtered["atr_pct"].fillna(0) <= max_atr]
+    if selected_actions and "action" in filtered:
+        filtered = filtered[filtered["action"].isin(selected_actions)]
+    return filtered
+
+
+def _risk_plan_row(plan) -> dict:
+    return {
+        "entry_zone": _format_price_range(plan.entry_zone),
+        "entry": plan.entry,
+        "stop_loss": plan.stop_loss,
+        "targets": _format_targets(plan.targets),
+        "risk_reward": plan.risk_reward,
+        "risk_per_share": plan.risk_per_share,
+        "max_position_risk": plan.max_position_risk,
+        "planned_risk": plan.planned_risk,
+        "planned_position_value": plan.planned_position_value,
+        "position_size": plan.position_size,
+        "liquidity_ok": plan.liquidity_ok,
+        "setup_quality": plan.setup_quality,
+        "invalidation": plan.invalidation,
+    }
+
+
+def _session_check_text(checks: dict) -> str:
+    max_daily_loss = _format_price(float(checks.get("max_daily_loss", 0)))
+    max_trades = checks.get("max_trades_per_day", "-")
+    stop_losses = checks.get("stop_after_consecutive_losses", "-")
+    pdt = "PDT warning active" if checks.get("pdt_warning") else "PDT equity check passed or disabled"
+    return f"Session controls: max daily loss {max_daily_loss}, max trades {max_trades}, stop after {stop_losses} consecutive losses. {pdt}."
+
+
+def _indicator_rows(indicators: dict) -> list[dict[str, str]]:
+    rows = []
+    percent_keys = {"price_change_pct", "range_pct", "atr_pct", "gap_pct", "volatility"}
+    price_keys = {
+        "vwap",
+        "sma_9",
+        "sma_20",
+        "sma_50",
+        "support",
+        "resistance",
+        "session_open",
+        "session_high",
+        "session_low",
+        "prior_high",
+        "prior_low",
+        "prior_close",
+        "opening_range_high",
+        "opening_range_low",
+    }
+    for key, value in indicators.items():
+        if value is None:
+            display = "-"
+        elif key in percent_keys:
+            display = _format_percent(float(value))
+        elif key in price_keys:
+            display = _format_price(float(value))
+        elif isinstance(value, float):
+            display = f"{value:,.3f}"
+        else:
+            display = str(value)
+        rows.append({"name": key, "value": display})
+    return rows
+
+
+def _format_price_range(value: tuple[float, float] | list[float] | None) -> str:
+    if not value:
+        return "-"
+    return f"{_format_price(float(value[0]))} to {_format_price(float(value[1]))}"
+
+
+def _format_targets(values: list[float]) -> str:
+    return ", ".join(_format_price(float(value)) for value in values) if values else "-"
 
 
 def _render_symbol_sidebar(settings) -> list[str]:
@@ -323,7 +434,7 @@ def _render_symbol_news_summary(summary: dict) -> None:
     )
 
     sources = pd.DataFrame(summary.get("sources", []))
-    with st.expander(f"Sources: {summary.get('source_count', 0)}"):
+    with st.expander(f"{summary.get('source_count', 0)} linked sources"):
         if sources.empty:
             st.info("No linked sources were returned.")
         else:
@@ -339,10 +450,71 @@ def _render_symbol_news_summary(summary: dict) -> None:
             )
 
 
+def _render_journal(settings, symbols: list[str]) -> None:
+    st.subheader("Trade Review Journal")
+    st.caption("Local JSONL journal for reviewing setup quality, risk discipline, and outcome. This stays out of Git by default.")
+    recent = load_journal_entries(settings, limit=100)
+    with st.form("journal_form"):
+        c1, c2, c3, c4 = st.columns(4)
+        symbol = c1.text_input("Symbol", value=(symbols[0] if symbols else str(settings.dashboard.get("default_symbol", "AAPL")))).upper()
+        action = c2.selectbox("Action", ["long", "short", "watch", "no_trade", "low_confidence"])
+        setup_type = c3.selectbox("Setup", ["opening_range_break", "vwap_reclaim", "vwap_loss", "trend_pullback", "gap_and_go", "reversal", "news_catalyst", "other"])
+        outcome = c4.selectbox("Outcome", ["open", "win", "loss", "breakeven", "skipped"])
+        c5, c6, c7, c8 = st.columns(4)
+        followed_plan = c5.checkbox("Followed plan")
+        risk_respected = c6.checkbox("Risk respected")
+        entry_quality = c7.slider("Entry quality", 1, 5, 3)
+        exit_quality = c8.slider("Exit quality", 1, 5, 3)
+        emotional_state = st.selectbox("State", ["calm", "neutral", "hesitant", "rushed", "revenge", "overconfident"])
+        notes = st.text_area("Notes")
+        submitted = st.form_submit_button("Save Review")
+    if submitted:
+        record = append_journal_entry(
+            settings,
+            {
+                "symbol": symbol,
+                "action": action,
+                "setup_type": setup_type,
+                "followed_plan": followed_plan,
+                "risk_respected": risk_respected,
+                "entry_quality": entry_quality,
+                "exit_quality": exit_quality,
+                "emotional_state": emotional_state,
+                "outcome": outcome,
+                "notes": notes,
+            },
+        )
+        st.success(f"Saved journal entry for {record['symbol']}.")
+        recent = load_journal_entries(settings, limit=100)
+    if recent:
+        df = pd.DataFrame(recent)
+        st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("No journal entries yet.")
+
+
 def _rounded_row(row: dict) -> dict:
     rounded = dict(row)
-    percent_keys = {"change_pct", "gap_pct", "atr_pct", "confidence"}
-    for key in ["price", "change_pct", "volume_anomaly", "gap_pct", "atr_pct", "confidence", "score", "risk_reward", "rank_score"]:
+    percent_keys = {"change_pct", "gap_pct", "atr_pct", "confidence", "extension_from_vwap_pct", "distance_to_support_pct", "distance_to_resistance_pct"}
+    for key in [
+        "price",
+        "change_pct",
+        "volume_anomaly",
+        "gap_pct",
+        "atr_pct",
+        "confidence",
+        "score",
+        "risk_reward",
+        "rank_score",
+        "prior_high",
+        "prior_low",
+        "session_open",
+        "opening_range_high",
+        "opening_range_low",
+        "extension_from_vwap_pct",
+        "distance_to_support_pct",
+        "distance_to_resistance_pct",
+    ]:
         if rounded.get(key) is not None:
             value = float(rounded[key])
             if key in percent_keys:
@@ -381,6 +553,14 @@ def _scanner_column_config() -> dict:
         "volume_anomaly": st.column_config.NumberColumn("RVOL", format="%.2f"),
         "gap_pct": st.column_config.NumberColumn("Gap", format="%.2f%%"),
         "atr_pct": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
+        "prior_high": st.column_config.NumberColumn("Prior High", format="$%.2f"),
+        "prior_low": st.column_config.NumberColumn("Prior Low", format="$%.2f"),
+        "session_open": st.column_config.NumberColumn("Open", format="$%.2f"),
+        "opening_range_high": st.column_config.NumberColumn("OR High", format="$%.2f"),
+        "opening_range_low": st.column_config.NumberColumn("OR Low", format="$%.2f"),
+        "extension_from_vwap_pct": st.column_config.NumberColumn("VWAP Dist", format="%.2f%%"),
+        "distance_to_support_pct": st.column_config.NumberColumn("Support Dist", format="%.2f%%"),
+        "distance_to_resistance_pct": st.column_config.NumberColumn("Resistance Dist", format="%.2f%%"),
         "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
         "score": st.column_config.NumberColumn("Score", format="%.3f"),
         "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
@@ -403,6 +583,9 @@ def _risk_column_config() -> dict:
         "entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
         "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f"),
         "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
+        "risk_per_share": st.column_config.NumberColumn("Risk/Share", format="$%.2f"),
+        "planned_risk": st.column_config.NumberColumn("Planned Risk", format="$%.2f"),
+        "planned_position_value": st.column_config.NumberColumn("Position Value", format="$%.2f"),
         "max_position_risk": st.column_config.NumberColumn("Max Risk", format="$%.2f"),
     }
 
@@ -434,6 +617,10 @@ def _trade_log_column_config() -> dict:
         "target": st.column_config.NumberColumn("Target", format="$%.2f"),
         "exit_price": st.column_config.NumberColumn("Exit", format="$%.2f"),
         "return": st.column_config.NumberColumn("Return", format="%.2f%%"),
+        "trade_return": st.column_config.NumberColumn("Trade Return", format="%.2f%%"),
+        "r_multiple": st.column_config.NumberColumn("R", format="%.2f"),
+        "max_adverse_excursion": st.column_config.NumberColumn("MAE", format="%.2f%%"),
+        "max_favorable_excursion": st.column_config.NumberColumn("MFE", format="%.2f%%"),
         "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
         "score": st.column_config.NumberColumn("Score", format="%.3f"),
         "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),

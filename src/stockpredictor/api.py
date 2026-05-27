@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from .backtesting import run_backtest
 from .config import load_settings
+from .journal import append_journal_entry, load_journal_entries
 from .news import build_news_feed
 from .pipeline import analyze_symbol, scan_symbols
 from .symbols import search_symbols
@@ -25,6 +26,23 @@ class BacktestRequest(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
+    config_path: str | None = Field(default=None)
+
+
+class JournalRequest(BaseModel):
+    symbol: str
+    action: str = Field(default="watch")
+    setup_type: str = Field(default="unclassified")
+    followed_plan: bool = Field(default=False)
+    emotional_state: str = Field(default="neutral")
+    entry_quality: int = Field(default=3, ge=1, le=5)
+    exit_quality: int = Field(default=3, ge=1, le=5)
+    risk_respected: bool = Field(default=False)
+    outcome: str = Field(default="open")
+    notes: str = Field(default="")
+    decision_score: float | None = Field(default=None)
+    confidence: float | None = Field(default=None)
+    risk_reward: float | None = Field(default=None)
     config_path: str | None = Field(default=None)
 
 
@@ -75,6 +93,16 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.get("/signals/latest")
     def latest_signals() -> list[dict[str, Any]]:
         return to_serializable(app.state.latest_signals)
+
+    @app.get("/journal")
+    def journal(limit: int = 100) -> list[dict[str, Any]]:
+        return to_serializable(load_journal_entries(app.state.settings, limit=limit))
+
+    @app.post("/journal")
+    def create_journal_entry(request: JournalRequest) -> dict[str, Any]:
+        active_settings = _settings_for_request(app, request.config_path)
+        payload = request.model_dump(exclude={"config_path"})
+        return to_serializable(append_journal_entry(active_settings, payload))
 
     return app
 

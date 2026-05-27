@@ -52,6 +52,19 @@ Run tests:
 The module form is preferred on Windows because it does not depend on the user
 Python Scripts directory being on `PATH`.
 
+API Additions
+-------------
+
+The local API includes:
+
+- `GET /symbols/search?q=palantir`
+- `GET /news?symbols=AAPL,PLTR`
+- `GET /journal`
+- `POST /journal`
+
+The journal stores local review notes in `data/trade_journal.local.jsonl` by
+default. That file is ignored by Git.
+
 Configuration
 -------------
 
@@ -66,6 +79,11 @@ limits, context-agent sources, backtest settings, and dashboard defaults.
 The default data provider is `yfinance`. If market data fails and
 `allow_synthetic_fallback` is enabled, the app uses deterministic synthetic data
 so the local UI and tests can still run.
+
+Day-trader overlays such as premarket high/low, spreads, halt status, float, and
+true time-of-day relative volume require an intraday/scanner data provider. The
+default free provider exposes enough data for local research, but not every
+professional scanner field.
 
 Local News LLM
 --------------

@@ -60,13 +60,22 @@ def test_api_health_config_and_analyze(tmp_path: Path, monkeypatch) -> None:
     assert "trade_log" in backtest.json()
     assert "evaluations" in backtest.json()
 
+    journal = client.post("/journal", json={"symbol": "TEST", "action": "long", "setup_type": "vwap_reclaim"})
+    assert journal.status_code == 200
+    assert journal.json()["symbol"] == "TEST"
+
+    journal_rows = client.get("/journal")
+    assert journal_rows.status_code == 200
+    assert journal_rows.json()[-1]["setup_type"] == "vwap_reclaim"
+
 
 def _api_config(tmp_path: Path) -> Path:
-    raw = yaml.safe_load(Path("configs/default.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
     raw["data"]["provider"] = "synthetic"
     raw["data"]["min_rows"] = 60
     raw["models"]["enabled"] = ["baseline"]
     raw["context_agent"]["enabled"] = False
+    raw["journal"] = {"enabled": True, "path": str(tmp_path / "journal.local.jsonl")}
     raw["watchlists"]["default"] = ["TEST"]
     config_path = tmp_path / "api_config.yaml"
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")

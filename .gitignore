@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .env
 configs/default.yaml
+data/*.jsonl
 *.log
 dist/
 build/
