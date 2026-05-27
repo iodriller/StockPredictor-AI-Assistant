@@ -32,7 +32,7 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     if "manual" in sources:
         items.extend(cfg.get("manual_items", []))
     if include_live_sources and "yfinance_news" in sources:
-        items.extend(_yfinance_news(symbol))
+        items.extend(fetch_news_items([symbol], limit=5))
 
     catalysts: list[str] = []
     risks: list[str] = []
@@ -98,6 +98,13 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     )
 
 
+def fetch_news_items(symbols: list[str], limit: int = 25) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for symbol in symbols:
+        items.extend(_yfinance_news(symbol))
+    return items[:limit]
+
+
 def _yfinance_news(symbol: str) -> list[dict[str, Any]]:
     try:
         import yfinance as yf
@@ -109,8 +116,31 @@ def _yfinance_news(symbol: str) -> list[dict[str, Any]]:
     for entry in news[:5]:
         content = entry.get("content", entry) if isinstance(entry, dict) else {}
         title = content.get("title") or entry.get("title") if isinstance(entry, dict) else ""
+        link = ""
+        canonical = content.get("canonicalUrl") if isinstance(content, dict) else None
+        if isinstance(canonical, dict):
+            link = str(canonical.get("url") or "")
+        elif isinstance(entry, dict):
+            link = str(entry.get("link") or "")
+        provider = ""
+        content_provider = content.get("provider") if isinstance(content, dict) else None
+        if isinstance(content_provider, dict):
+            provider = str(content_provider.get("displayName") or "")
+        published = content.get("pubDate") or entry.get("providerPublishTime", "") if isinstance(entry, dict) else ""
         if title:
-            items.append({"source": "yfinance_news", "title": title})
+            impact = _score_item(title, {})
+            items.append(
+                {
+                    "symbol": symbol.upper(),
+                    "source": "yfinance_news",
+                    "provider": provider or "Yahoo Finance",
+                    "title": title,
+                    "url": link,
+                    "published": str(published),
+                    "impact": impact,
+                    "sentiment": "bullish" if impact > 0.15 else "bearish" if impact < -0.15 else "neutral",
+                }
+            )
     return items
 
 

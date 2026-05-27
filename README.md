@@ -16,6 +16,7 @@ Quick Start
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -U pip
 .\.venv\Scripts\python -m pip install -e ".[dev]"
+Copy-Item configs/default.example.yaml configs/default.yaml
 ```
 
 Run the API:
@@ -54,6 +55,10 @@ Python Scripts directory being on `PATH`.
 Configuration
 -------------
 
+The example runtime configuration is `configs/default.example.yaml`. Copy it to
+`configs/default.yaml` for local use. The local file is ignored by Git so keys,
+local endpoints, account settings, and watchlists do not get pushed.
+
 The main runtime configuration is `configs/default.yaml`. It controls data
 providers, watchlists, indicators, enabled models, signal-fusion weights, risk
 limits, context-agent sources, backtest settings, and dashboard defaults.
@@ -61,6 +66,25 @@ limits, context-agent sources, backtest settings, and dashboard defaults.
 The default data provider is `yfinance`. If market data fails and
 `allow_synthetic_fallback` is enabled, the app uses deterministic synthetic data
 so the local UI and tests can still run.
+
+Local News LLM
+--------------
+
+The news feed can use a local LLM through the sibling `LocalDeploy` project.
+The default config points to:
+
+```text
+http://127.0.0.1:8100/v1/chat/completions
+```
+
+with model/profile:
+
+```text
+qwen3vl_8b_ollama
+```
+
+If LocalDeploy is not running, the app falls back to the built-in heuristic news
+classifier and summarizer.
 
 Trader Agent
 ------------

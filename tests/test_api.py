@@ -8,10 +8,22 @@ from fastapi.testclient import TestClient
 from stockpredictor.api import create_app
 
 
-def test_api_health_config_and_analyze(tmp_path: Path) -> None:
+def test_api_health_config_and_analyze(tmp_path: Path, monkeypatch) -> None:
     config_path = _api_config(tmp_path)
     app = create_app(str(config_path))
     client = TestClient(app)
+    monkeypatch.setattr("stockpredictor.api.search_symbols", lambda q, limit=25: [{"symbol": "TEST", "name": "Test Corp", "source": "fixture"}])
+    monkeypatch.setattr(
+        "stockpredictor.api.build_news_feed",
+        lambda symbols, settings, limit=25: {
+            "symbols": symbols,
+            "headline_count": 1,
+            "source_count": 1,
+            "summaries": [{"symbol": symbols[0], "grand_summary": "Test summary", "source_count": 1, "sources": []}],
+            "headlines": [{"symbol": symbols[0], "title": "Test raises guidance", "sentiment": "bullish"}],
+            "analysis_provider": "fixture",
+        },
+    )
 
     health = client.get("/health")
     assert health.status_code == 200
@@ -20,6 +32,14 @@ def test_api_health_config_and_analyze(tmp_path: Path) -> None:
     config = client.get("/config")
     assert config.status_code == 200
     assert config.json()["data"]["provider"] == "synthetic"
+
+    symbols = client.get("/symbols/search?q=test")
+    assert symbols.status_code == 200
+    assert symbols.json()[0]["symbol"] == "TEST"
+
+    news = client.get("/news?symbols=TEST")
+    assert news.status_code == 200
+    assert news.json()["summaries"][0]["grand_summary"] == "Test summary"
 
     analysis = client.post("/analyze/TEST")
     assert analysis.status_code == 200

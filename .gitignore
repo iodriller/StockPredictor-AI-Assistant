@@ -1,11 +1,13 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
 venv/
 .env
+configs/default.yaml
 *.log
 dist/
 build/

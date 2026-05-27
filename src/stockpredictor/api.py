@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field
 
 from .backtesting import run_backtest
 from .config import load_settings
+from .news import build_news_feed
 from .pipeline import analyze_symbol, scan_symbols
+from .symbols import search_symbols
 from .utils import to_serializable
 
 
@@ -39,6 +41,17 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.get("/config")
     def config() -> dict[str, Any]:
         return to_serializable(app.state.settings.raw)
+
+    @app.get("/symbols/search")
+    def symbol_search(q: str, limit: int = 25) -> list[dict[str, Any]]:
+        return to_serializable(search_symbols(q, limit=limit))
+
+    @app.get("/news")
+    def news(symbols: str = "", limit: int = 25) -> dict[str, Any]:
+        requested_symbols = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+        if not requested_symbols:
+            requested_symbols = app.state.settings.watchlist()[:5]
+        return to_serializable(build_news_feed(requested_symbols, app.state.settings, limit=limit))
 
     @app.post("/scan")
     def scan(request: ScanRequest | None = Body(default=None)) -> list[dict[str, Any]]:
@@ -73,4 +86,3 @@ def _settings_for_request(app: FastAPI, config_path: str | None):
 
 
 app = create_app()
-
