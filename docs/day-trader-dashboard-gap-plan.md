@@ -35,7 +35,8 @@ workflow sources. It is research and product planning, not financial advice.
   tick-level intraday filters still need a dedicated intraday data provider for
   premarket, spread, float, halt, and high-of-day momentum coverage.
 - News is now a first-class workflow with per-symbol summaries, source links,
-  sentiment, impact, category, and local LLM support.
+  sentiment, impact, category, local LLM support, and optional article excerpts
+  passed into the summarizer.
 - Charts now show candles, volume, VWAP/moving averages, session/prior levels,
   opening-range availability, and risk-plan overlays for entry, stop, targets,
   and entry zone.
@@ -66,9 +67,11 @@ workflow sources. It is research and product planning, not financial advice.
      legal/regulatory, M&A, market sentiment, or other.
    - Add per-stock grand summaries, day-trader focus, source counts, and
      clickable source details.
-   - Use configured LLM summarization when available; fall back to deterministic
-     heuristic analysis when no API key is configured.
-   - Status: implemented as a first pass using `context_agent.news_analysis`.
+  - Use configured LLM summarization when available.
+  - Make any heuristic fallback explicit in the UI and support disabling fallback
+    entirely when LLM summaries are required.
+  - Status: implemented using `context_agent.news_analysis`; local config now
+    requires LocalDeploy for summaries, and article excerpt scraping is enabled.
 
 3. **Scanner polish**
    - Show price, percent change, gap, RVOL, ATR percent, trend, regime, action,
@@ -113,8 +116,9 @@ workflow sources. It is research and product planning, not financial advice.
 - A user can search for a ticker not in the watchlist and analyze it.
 - A user can enter custom ticker lists for scan and backtest.
 - Scanner table is readable without interpreting raw decimals.
-- Ticker deep dive shows candles, volume, levels, predictions, signal, risk,
-  context, and technicals in trader-facing sections.
+- Ticker deep dive shows a decision-first trade plan, candles, volume, levels,
+  context/catalyst, and advanced model/signal/indicator details in collapsed
+  sections.
 - News tab shows recent headlines for selected tickers.
 - Dashboard still runs locally through the project `.venv`.
 - API includes symbol search and news endpoints.
@@ -133,6 +137,10 @@ workflow sources. It is research and product planning, not financial advice.
   - Expandable source table with provider, timestamp, category, sentiment,
     impact, headline, and link.
 - LLM behavior is configured under `context_agent.news_analysis.llm`.
-- When `OPENAI_API_KEY` is present and LLM analysis is enabled, the system uses
-  OpenAI Responses API classification/summarization.
-- When the key is missing, the news feed still works using the local classifier.
+- LocalDeploy is the preferred local summarizer at
+  `http://127.0.0.1:8100/v1/chat/completions`.
+- Heuristic fallback is controlled by `fallback_to_heuristic`; when disabled,
+  the News tab stops and reports the LLM error instead of producing a fallback
+  summary.
+- Article excerpt fetching is controlled by
+  `context_agent.news_analysis.article_scraping`.

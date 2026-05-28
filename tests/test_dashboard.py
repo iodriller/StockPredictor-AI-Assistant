@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from stockpredictor.ui.dashboard import _price_chart
+from stockpredictor.ui.dashboard import HELP_TEXT, _indicator_rows, _price_chart, _scanner_summary_df
 
 
 def test_price_chart_uses_configured_ma_windows_and_result_levels() -> None:
@@ -25,3 +25,92 @@ def test_price_chart_uses_configured_ma_windows_and_result_levels() -> None:
     assert "SMA_9" not in trace_names
     assert "prior_high: $99.00" in annotation_texts
     assert "session_open: $88.00" in annotation_texts
+
+
+def test_scanner_summary_keeps_compact_trader_columns() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "symbol": "LOW",
+                "action": "watch",
+                "rank_score": 0.2,
+                "confidence": 40.0,
+                "price": 10.0,
+                "change_pct": 1.2,
+                "volume_anomaly": 1.1,
+                "gap_pct": 0.2,
+                "relative_strength_pct": -0.3,
+                "top_reason": "mixed",
+                "volume": 100000,
+                "avg_volume": 90000,
+            },
+            {
+                "symbol": "HIGH",
+                "action": "long",
+                "rank_score": 0.9,
+                "confidence": 70.0,
+                "price": 20.0,
+                "change_pct": 3.0,
+                "volume_anomaly": 2.5,
+                "gap_pct": 1.0,
+                "relative_strength_pct": 1.8,
+                "top_reason": "breakout",
+                "volume": 300000,
+                "avg_volume": 100000,
+            },
+        ]
+    )
+
+    summary = _scanner_summary_df(df)
+
+    assert summary["symbol"].tolist() == ["HIGH", "LOW"]
+    assert "volume" not in summary.columns
+    assert "avg_volume" not in summary.columns
+    assert list(summary.columns) == [
+        "symbol",
+        "action",
+        "rank_score",
+        "confidence",
+        "price",
+        "change_pct",
+        "volume_anomaly",
+        "gap_pct",
+        "relative_strength_pct",
+        "top_reason",
+    ]
+
+
+def test_indicator_rows_use_readable_labels() -> None:
+    rows = _indicator_rows(
+        {
+            "price_change_pct": 0.0123,
+            "sma_20": 101.25,
+            "volume_anomaly": 2.4,
+            "opening_range_status": "available",
+        }
+    )
+
+    labels = {row["name"]: row["value"] for row in rows}
+
+    assert labels["Price Change"] == "1.23%"
+    assert labels["SMA 20"] == "$101.25"
+    assert labels["Relative Volume"] == "2.400"
+    assert labels["Opening Range Status"] == "available"
+
+
+def test_help_text_covers_decision_critical_terms() -> None:
+    required = {
+        "action",
+        "confidence",
+        "rank",
+        "risk_reward",
+        "entry",
+        "stop",
+        "target",
+        "catalyst_score",
+        "analysis_provider",
+        "backtest_win_rate",
+    }
+
+    assert required.issubset(HELP_TEXT)
+    assert all(HELP_TEXT[key] for key in required)

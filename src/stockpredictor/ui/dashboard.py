@@ -17,10 +17,51 @@ from stockpredictor.journal import (
     load_journal_entries,
     update_journal_entry,
 )
-from stockpredictor.news import build_news_feed
+from stockpredictor.news import NewsAnalysisError, build_news_feed
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.symbols import normalize_symbol, search_symbols
-from stockpredictor.utils import clean_symbol_list, to_serializable
+from stockpredictor.utils import clean_symbol_list, to_float, to_serializable
+
+
+HELP_TEXT = {
+    "action": "The fused decision from models, technicals, context, and risk checks. Treat watch/no-trade/low-confidence as valid outcomes, not failures.",
+    "analysis_provider": "Shows whether news summaries came from the configured LLM, heuristic fallback, or heuristic-only mode.",
+    "article_excerpts": "Short excerpts fetched from source links and passed to the LLM. This improves context but is not a full professional news feed.",
+    "atr_pct": "Average True Range as a percent of price. Higher ATR means wider stops and more risk per share.",
+    "avg_rvol": "Average relative volume for the scanned rows. Above 1.0 means volume is higher than recent average.",
+    "backtest_average_return": "Average return per simulated trade/evaluation. This is a logic sanity check, not proof of future performance.",
+    "backtest_no_trade_rate": "How often the strategy skipped instead of forcing a trade. A healthy strategy often has a meaningful no-trade rate.",
+    "backtest_sharpe_like": "Simple return-to-volatility metric. Useful for comparing runs, but unstable on small samples.",
+    "backtest_win_rate": "Percent of simulated trades that were profitable. Needs to be read with average win/loss and drawdown.",
+    "bias": "The current trade bias: long, short, watch, no-trade, or low-confidence.",
+    "catalyst_score": "How strongly the context/news pipeline sees a tradable catalyst. Higher is better, but price and volume still need to confirm.",
+    "confidence": "How much agreement/strength the fused signal has. Low confidence usually means wait or reduce attention.",
+    "context_confidence": "How complete and usable the contextual evidence is. Low context confidence means news/catalyst evidence is thin.",
+    "drawdown": "Largest peak-to-trough equity loss during the simulation. This is one of the main stress checks.",
+    "entry": "A suggested trigger or reference price. It is not a market order instruction.",
+    "entry_zone": "A price area where the setup is considered valid. Chasing outside the zone can ruin risk/reward.",
+    "freshness": "How recent the catalyst evidence is. Fresh items matter more for day trading than stale headlines.",
+    "gap_pct": "Open versus prior close. Gaps can signal catalysts, but large gaps can also be late or risky.",
+    "headline_relevance": "A score for how relevant a headline looks to active trading based on category, impact, and freshness.",
+    "impact": "Estimated directional headline impact. Positive is bullish, negative is bearish, near zero is neutral/noisy.",
+    "invalidation": "The condition that says the trade idea is wrong. Define this before entry.",
+    "mae": "Maximum adverse excursion: worst unrealized move against the trade during the simulation.",
+    "mfe": "Maximum favorable excursion: best unrealized move in favor of the trade during the simulation.",
+    "news_sources": "Number of linked source items used for this symbol summary. Click the source expander to inspect links.",
+    "position": "Estimated share count from risk sizing. Blank means no actionable trade plan was generated.",
+    "rank": "Scanner priority score combining movement, volume, confidence, catalysts, and setup quality.",
+    "relative_strength": "Symbol performance versus the configured benchmark. Positive means it is outperforming the benchmark.",
+    "risk_reward": "Potential reward divided by risk. Below the configured minimum should usually block the trade.",
+    "score": "Signed fused score. Positive favors long, negative favors short, near zero means mixed/noisy.",
+    "sentiment": "News/context tone. Use it as supporting evidence, not a standalone trade signal.",
+    "setup": "Quality label for the current trade structure after risk, liquidity, and signal checks.",
+    "stop": "Planned exit if the setup fails. The stop should be tied to structure, VWAP, ATR, or invalidation.",
+    "target": "Planned reward area. Targets should be realistic relative to nearby resistance/support and volatility.",
+    "top_reason": "The strongest reason behind the current signal. Read with skip reasons before acting.",
+    "trade_watch": "Rows that are actionable or worth monitoring. This excludes low-confidence/no-trade rows.",
+    "vwap": "Volume Weighted Average Price. Day traders often use it as an intraday fair-value line.",
+    "vwap_alignment": "Whether price is above or below VWAP. Above often supports longs; below often warns against longs.",
+}
 
 
 def main() -> None:
@@ -29,7 +70,8 @@ def main() -> None:
     st.title("StockPredictor Trading Intelligence")
     st.caption("Research and decision support only. No brokerage execution.")
 
-    config_path = st.sidebar.text_input("Config path", value=args.config)
+    with st.sidebar.expander("Advanced setup", expanded=False):
+        config_path = st.text_input("Config file", value=args.config, help="YAML config controlling providers, models, risk limits, watchlists, context, and dashboard defaults.")
     try:
         settings = load_settings(config_path)
     except ConfigError as exc:
@@ -39,58 +81,40 @@ def main() -> None:
     symbols = _render_symbol_sidebar(settings)
 
     scan_tab, deep_dive_tab, news_tab, backtest_tab, journal_tab, config_tab = st.tabs(
-        ["Scanner", "Ticker Deep Dive", "News Feed", "Backtest", "Journal", "Config"]
+        ["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"]
     )
     with scan_tab:
         _render_scanner(settings, symbols)
     with deep_dive_tab:
         default_symbol = symbols[0] if symbols else settings.dashboard.get("default_symbol", "AAPL")
-        col_sym, col_horizon = st.columns([3, 1])
-        selected_symbol = col_sym.text_input("Symbol", value=str(default_symbol)).upper()
+        col_sym, col_horizon = st.columns([2, 3])
+        selected_symbol = col_sym.text_input("Symbol", value=str(default_symbol), help="Ticker to analyze. Use the sidebar search if you do not know the symbol.").upper()
         horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
         default_horizon = settings.horizons.get("default", "swing")
-        try:
-            default_index = horizon_options.index(default_horizon)
-        except ValueError:
-            default_index = 0
-        selected_horizon = col_horizon.selectbox("Horizon", horizon_options, index=default_index)
-        if st.button("Analyze", type="primary"):
+        selected_horizon = _render_horizon_selector(col_horizon, horizon_options, str(default_horizon))
+        if st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon."):
             _render_analysis(settings, selected_symbol, horizon=selected_horizon)
     with news_tab:
         _render_news(settings, symbols or settings.watchlist())
     with backtest_tab:
-        if st.button("Run Backtest"):
-            report = run_backtest(settings, symbols=symbols or None)
-            report_df = pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"])
-            report_df = _percent_display(report_df, ["win_rate", "average_return", "max_drawdown", "no_trade_rate"])
-            st.dataframe(
-                report_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config=_backtest_column_config(),
-            )
-            if report.equity_curve:
-                equity_df = pd.DataFrame(report.equity_curve)
-                st.line_chart(equity_df.set_index("date")["equity"])
-            if report.trade_log:
-                st.subheader("Trade Log")
-                trade_log_df = _percent_display(
-                    pd.DataFrame(report.trade_log),
-                    ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
-                )
-                st.dataframe(trade_log_df, use_container_width=True, hide_index=True, column_config=_trade_log_column_config())
+        _render_backtest(settings, symbols)
     with journal_tab:
         _render_journal(settings, symbols)
     with config_tab:
-        st.json(to_serializable(settings.raw))
+        _render_settings_tab(settings, symbols)
 
 
 def _render_scanner(settings, symbols: list[str]) -> None:
     st.subheader("Scanner")
-    st.caption("Ranks the selected symbols by movement, volume, signal confidence, catalyst/risk flags, and setup quality.")
+    with st.expander("How to read the scanner", expanded=False):
+        st.write(
+            "Start with Rank, Action, RVOL, Gap, and Relative Strength. "
+            "A good row should have movement, liquidity, a clear reason, and acceptable risk. "
+            "Low-confidence and no-trade rows are useful because they tell you what to ignore."
+        )
     if settings.raw.get("scanner", {}).get("intraday_provider_note", False):
         st.caption("Provider note: premarket high/low, spread, float, halt status, and time-of-day RVOL require a dedicated intraday scanner provider.")
-    if st.button("Run Scan", type="primary"):
+    if st.button("Scan Selected Symbols", type="primary"):
         results = scan_symbols(
             settings,
             symbols=symbols or None,
@@ -107,11 +131,130 @@ def _render_scanner(settings, symbols: list[str]) -> None:
             return
         actionable = int(df["action"].isin(["long", "short", "watch"]).sum()) if "action" in df else 0
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Scanned", len(df))
-        c2.metric("Actionable / Watch", actionable)
-        c3.metric("Avg RVOL", f"{df['volume_anomaly'].dropna().mean():.2f}" if "volume_anomaly" in df else "-")
-        c4.metric("Top Rank", f"{df['rank_score'].max():.3f}" if "rank_score" in df else "-")
-        st.dataframe(df, use_container_width=True, hide_index=True, column_config=_scanner_column_config())
+        c1.metric("Scanned", len(df), help="Number of rows remaining after filters.")
+        c2.metric("Trade / Watch", actionable, help=HELP_TEXT["trade_watch"])
+        c3.metric("Avg RVOL", f"{df['volume_anomaly'].dropna().mean():.2f}" if "volume_anomaly" in df else "-", help=HELP_TEXT["avg_rvol"])
+        c4.metric("Top Rank", f"{df['rank_score'].max():.3f}" if "rank_score" in df else "-", help=HELP_TEXT["rank"])
+        st.dataframe(
+            _scanner_summary_df(df),
+            use_container_width=True,
+            hide_index=True,
+            column_config=_scanner_column_config(compact=True),
+        )
+        _render_scanner_detail(df)
+
+
+def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
+    options = horizon_options or ["swing"]
+    default = default_horizon if default_horizon in options else options[0]
+    format_func = lambda value: str(value).replace("_", " ").title()
+    help_text = "Intraday emphasizes session/VWAP behavior; swing uses multi-day signals; position uses a longer lookback and wider risk."
+    if hasattr(container, "segmented_control"):
+        selected = container.segmented_control("Horizon", options=options, default=default, format_func=format_func, help=help_text)
+    else:
+        selected = container.radio("Horizon", options=options, index=options.index(default), horizontal=True, format_func=format_func, help=help_text)
+    return str(selected or default)
+
+
+def _scanner_summary_df(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "symbol",
+        "action",
+        "rank_score",
+        "confidence",
+        "price",
+        "change_pct",
+        "volume_anomaly",
+        "gap_pct",
+        "relative_strength_pct",
+        "top_reason",
+    ]
+    visible = [column for column in columns if column in df.columns]
+    summary = df[visible].copy()
+    if "rank_score" in summary:
+        summary = summary.sort_values("rank_score", ascending=False)
+    return summary
+
+
+def _render_scanner_detail(df: pd.DataFrame) -> None:
+    if df.empty or "symbol" not in df:
+        return
+    st.subheader("Symbol Detail")
+    options: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        label = _scanner_detail_label(row_dict)
+        options[label] = row_dict
+    selected = st.selectbox("Choose symbol", list(options.keys()))
+    row = options[selected]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Setup", str(row.get("setup_quality", "-")), help=HELP_TEXT["setup"])
+    c2.metric("Risk/Reward", _format_scanner_value("risk_reward", row.get("risk_reward")), help=HELP_TEXT["risk_reward"])
+    c3.metric("VWAP", str(row.get("vwap_alignment", "-")), help=HELP_TEXT["vwap_alignment"])
+    c4.metric("Regime", str(row.get("regime", "-")), help="Market behavior label such as trending, choppy, high-volatility, or low-volatility.")
+
+    groups = {
+        "Trade Setup": [
+            "action",
+            "confidence",
+            "score",
+            "rank_score",
+            "setup_quality",
+            "top_reason",
+            "skip_reasons",
+            "risk_reward",
+            "catalyst_flag",
+            "risk_flag",
+        ],
+        "Movement And Volume": [
+            "price",
+            "change_pct",
+            "volume",
+            "avg_volume",
+            "volume_anomaly",
+            "gap_pct",
+            "atr_pct",
+            "high_relative_volume",
+            "meaningful_gap",
+        ],
+        "Levels": [
+            "session_open",
+            "prior_high",
+            "prior_low",
+            "opening_range_high",
+            "opening_range_low",
+            "opening_range_status",
+            "extension_from_vwap_pct",
+            "distance_to_support_pct",
+            "distance_to_resistance_pct",
+        ],
+        "Market Context": [
+            "benchmark",
+            "benchmark_change_pct",
+            "relative_strength_pct",
+            "trend",
+            "regime",
+            "liquidity_ok",
+        ],
+    }
+    for group, keys in groups.items():
+        rows = [
+            {"field": _humanize_key(key), "value": _format_scanner_value(key, row.get(key))}
+            for key in keys
+            if key in row and pd.notna(row.get(key))
+        ]
+        if rows:
+            with st.expander(group, expanded=(group == "Trade Setup")):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _scanner_detail_label(row: dict) -> str:
+    symbol = row.get("symbol", "-")
+    action = row.get("action", "-")
+    rank = _format_scanner_value("rank_score", row.get("rank_score"))
+    reason = row.get("top_reason", "-")
+    return f"{symbol} | {action} | rank {rank} | {reason}"
 
 
 def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
@@ -125,13 +268,14 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
     headline_label = "Live Price" if live_price is not None else "Last Close"
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Action", result.decision.action)
-    col2.metric("Confidence", _format_percent(result.decision.confidence))
-    col3.metric("Score", f"{result.decision.score:.3f}")
+    col1.metric("Action", result.decision.action, help=HELP_TEXT["action"])
+    col2.metric("Confidence", _format_percent(result.decision.confidence), help=HELP_TEXT["confidence"])
+    col3.metric("Score", f"{result.decision.score:.3f}", help=HELP_TEXT["score"])
     col4.metric(
         headline_label,
         _format_price(headline_price),
         _format_percent(result.snapshot.change_pct),
+        help="Latest available price from intraday data when available; otherwise last daily close.",
     )
 
     if session is not None and session.data_available:
@@ -140,18 +284,19 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
             f"Horizon: {result.horizon}."
         )
         sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        sc1.metric("Session VWAP", _format_price(session.session_vwap) if session.session_vwap else "-")
-        sc2.metric("Session Open", _format_price(session.session_open) if session.session_open else "-")
-        sc3.metric("Session High", _format_price(session.session_high) if session.session_high else "-")
-        sc4.metric("Session Low", _format_price(session.session_low) if session.session_low else "-")
+        sc1.metric("Session VWAP", _format_price(session.session_vwap) if session.session_vwap else "-", help=HELP_TEXT["vwap"])
+        sc2.metric("Session Open", _format_price(session.session_open) if session.session_open else "-", help="First regular-session price in the loaded intraday data.")
+        sc3.metric("Session High", _format_price(session.session_high) if session.session_high else "-", help="Highest price in the loaded session data.")
+        sc4.metric("Session Low", _format_price(session.session_low) if session.session_low else "-", help="Lowest price in the loaded session data.")
         sc5.metric(
             "TOD RVOL",
             f"{session.time_of_day_rvol:.2f}" if session.time_of_day_rvol is not None else "-",
+            help="Time-of-day relative volume. Above 1.0 means current volume is heavier than expected for this part of the session.",
         )
         pc1, pc2, pc3 = st.columns(3)
-        pc1.metric("Premarket High", _format_price(session.premarket_high) if session.premarket_high else "-")
-        pc2.metric("Premarket Low", _format_price(session.premarket_low) if session.premarket_low else "-")
-        pc3.metric("Opening Range", session.opening_range_status)
+        pc1.metric("Premarket High", _format_price(session.premarket_high) if session.premarket_high else "-", help="High from premarket bars when the provider supplies them.")
+        pc2.metric("Premarket Low", _format_price(session.premarket_low) if session.premarket_low else "-", help="Low from premarket bars when the provider supplies them.")
+        pc3.metric("Opening Range", session.opening_range_status, help="Whether the first configured minutes of regular-session data are available for breakout/reclaim checks.")
     elif session is not None:
         st.caption(f"Session: {session.market_session}. Intraday bars unavailable — analysis is daily-only.")
 
@@ -159,19 +304,22 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
     sector = result.sector_context
     calendar = result.calendar
     if market_state is not None or sector is not None or calendar is not None:
-        st.subheader("Context Cross-Check")
+        st.subheader("Market Cross-Check")
         mc1, mc2, mc3, mc4 = st.columns(4)
         if market_state is not None:
-            mc1.metric("SPY", _format_percent(market_state.spy_change_pct) if market_state.spy_change_pct is not None else "-")
-            mc2.metric("QQQ", _format_percent(market_state.qqq_change_pct) if market_state.qqq_change_pct is not None else "-")
-            mc3.metric("VIX", f"{market_state.vix_value:.2f}" if market_state.vix_value is not None else "-")
+            mc1.metric("SPY", _format_percent(market_state.spy_change_pct) if market_state.spy_change_pct is not None else "-", help="Broad-market benchmark. Long setups are cleaner when the market supports them.")
+            mc2.metric("QQQ", _format_percent(market_state.qqq_change_pct) if market_state.qqq_change_pct is not None else "-", help="Growth/tech benchmark. Especially relevant for many high-beta names.")
+            mc3.metric("VIX", f"{market_state.vix_value:.2f}" if market_state.vix_value is not None else "-", help="Volatility index. Higher VIX can mean wider stops, faster reversals, and smaller position size.")
         if sector is not None and sector.sector_etf:
             mc4.metric(
                 f"{sector.sector_etf} ({sector.alignment})",
                 _format_percent(sector.sector_change_pct) if sector.sector_change_pct is not None else "-",
+                help="Sector ETF movement and whether it aligns with the symbol. Sector confirmation helps avoid isolated weak setups.",
             )
         if calendar is not None and calendar.no_trade_flags:
             st.warning("Calendar flags: " + "; ".join(calendar.no_trade_flags))
+
+    _render_trade_plan_summary(result)
 
     if result.previous_snapshots:
         with st.expander(f"Compared to your last {len(result.previous_snapshots)} analyses"):
@@ -181,84 +329,121 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
             if result.snapshot_record is not None:
                 diff = diff_snapshots(result.snapshot_record, prev)
                 dcol1, dcol2, dcol3, dcol4 = st.columns(4)
-                dcol1.metric("Δ Score", f"{diff['score_delta']:+.3f}" if diff.get("score_delta") is not None else "-")
-                dcol2.metric("Δ Confidence", f"{diff['confidence_delta']:+.3f}" if diff.get("confidence_delta") is not None else "-")
-                dcol3.metric("Δ Price", _format_price(diff["live_price_delta"]) if diff.get("live_price_delta") is not None else "-")
-                dcol4.metric("Action Changed?", "yes" if diff.get("action_changed") else "no")
+                dcol1.metric("Δ Score", f"{diff['score_delta']:+.3f}" if diff.get("score_delta") is not None else "-", help="Change in fused score since the last saved analysis.")
+                dcol2.metric("Δ Confidence", f"{diff['confidence_delta']:+.3f}" if diff.get("confidence_delta") is not None else "-", help="Change in signal confidence since the last saved analysis.")
+                dcol3.metric("Δ Price", _format_price(diff["live_price_delta"]) if diff.get("live_price_delta") is not None else "-", help="Price change since the previous snapshot.")
+                dcol4.metric("Action Changed?", "yes" if diff.get("action_changed") else "no", help="Whether the fused action changed since the previous snapshot.")
                 st.caption(f"Previous action: {diff.get('previous_action', '-')} @ {diff.get('previous_timestamp', '-')}")
 
-    st.subheader("Price And Levels")
+    st.subheader("Chart And Levels")
     st.plotly_chart(
         _price_chart(frame, result.features.levels, result.risk_plan, ma_windows=settings.features.get("ma_windows", [9, 20, 50])),
         use_container_width=True,
     )
 
-    st.subheader("Model Predictions")
-    model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
-    st.dataframe(model_df, use_container_width=True, hide_index=True, column_config=_model_column_config())
+    _render_context_panel(result)
 
-    st.subheader("Signal")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "action": result.decision.action,
-                    "confidence": result.decision.confidence * 100,
-                    "score": result.decision.score,
-                    "top_reason": result.decision.top_reason,
-                    "reasons": "; ".join(result.decision.reasons),
-                }
-            ]
-        ),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
-            "score": st.column_config.NumberColumn("Score", format="%.3f"),
-        },
-    )
+    with st.expander("Model Details", expanded=False):
+        model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
+        st.dataframe(model_df, use_container_width=True, hide_index=True, column_config=_model_column_config())
 
-    st.subheader("Risk Plan")
-    st.dataframe(
-        pd.DataFrame([_risk_plan_row(result.risk_plan)]),
-        use_container_width=True,
-        hide_index=True,
-        column_config=_risk_column_config(),
-    )
-    if result.risk_plan.session_checks:
-        st.caption(_session_check_text(result.risk_plan.session_checks))
-    if result.risk_plan.no_trade_reasons:
-        st.warning("No-trade reasons: " + "; ".join(result.risk_plan.no_trade_reasons))
+    with st.expander("Full Signal / Risk Data", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "action": result.decision.action,
+                        "confidence": result.decision.confidence * 100,
+                        "score": result.decision.score,
+                        "top_reason": result.decision.top_reason,
+                        "reasons": "; ".join(result.decision.reasons),
+                    }
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
+                "score": st.column_config.NumberColumn("Score", format="%.3f"),
+            },
+        )
+        st.dataframe(
+            pd.DataFrame([_risk_plan_row(result.risk_plan)]),
+            use_container_width=True,
+            hide_index=True,
+            column_config=_risk_column_config(),
+        )
 
-    st.subheader("Context")
+    with st.expander("Indicator Details", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                _indicator_rows(to_serializable(result.features.indicators))
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def _render_trade_plan_summary(result) -> None:
+    plan = result.risk_plan
+    decision = result.decision
+    st.subheader("Decision And Plan")
+    with st.expander("Decision checklist", expanded=False):
+        st.write(
+            "Before acting, confirm: the setup has a clear catalyst or technical reason, "
+            "price respects the key level or VWAP, risk/reward meets your minimum, "
+            "position size fits max risk, and the invalidation is obvious."
+        )
+
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Bias", decision.action, help=HELP_TEXT["bias"])
+    p2.metric("Setup", plan.setup_quality, help=HELP_TEXT["setup"])
+    p3.metric("Confidence", _format_percent(decision.confidence), help=HELP_TEXT["confidence"])
+    p4.metric("Risk/Reward", f"{plan.risk_reward:.2f}" if plan.risk_reward is not None else "-", help=HELP_TEXT["risk_reward"])
+    p5.metric("Position", f"{plan.position_size:,}" if plan.position_size else "-", help=HELP_TEXT["position"])
+
+    levels = [
+        {"field": "Entry zone", "value": _format_price_range(plan.entry_zone)},
+        {"field": "Entry", "value": _format_price(plan.entry) if plan.entry else "-"},
+        {"field": "Stop", "value": _format_price(plan.stop_loss) if plan.stop_loss else "-"},
+        {"field": "Target", "value": _format_targets(plan.targets)},
+        {"field": "Invalidation", "value": plan.invalidation or "-"},
+    ]
+    st.dataframe(pd.DataFrame(levels), use_container_width=True, hide_index=True, column_config=_trade_plan_column_config())
+    st.caption(f"Primary reason: {decision.top_reason or '-'}")
+    if plan.no_trade_reasons:
+        st.warning("No-trade reasons: " + "; ".join(plan.no_trade_reasons))
+    if plan.session_checks:
+        st.caption(_session_check_text(plan.session_checks))
+
+
+def _render_context_panel(result) -> None:
+    st.subheader("Context And Catalyst")
     st.write(result.context.raw_summary)
-    context_metrics = {
-        "sentiment": result.context.sentiment,
-        **result.context.features,
-    }
-    context_metrics = _percent_context_metrics(context_metrics)
-    st.dataframe(pd.DataFrame([context_metrics]), use_container_width=True, hide_index=True, column_config=_context_column_config())
-    if result.context.catalysts:
-        st.write("Catalysts")
-        st.write(result.context.catalysts)
-    if result.context.risks:
-        st.write("Risks")
-        st.write(result.context.risks)
-    if result.context.reasons_to_trade:
-        st.write("Reasons To Trade")
-        st.write(result.context.reasons_to_trade)
-    if result.context.reasons_to_skip:
-        st.write("Reasons To Skip")
-        st.write(result.context.reasons_to_skip)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sentiment", result.context.sentiment, help=HELP_TEXT["sentiment"])
+    c2.metric("Catalyst Score", f"{to_float(result.context.features.get('catalyst_score'), 0.0):.2f}", help=HELP_TEXT["catalyst_score"])
+    c3.metric("Freshness", _format_percent(to_float(result.context.features.get("catalyst_freshness"), 0.0)), help=HELP_TEXT["freshness"])
+    c4.metric("Context Confidence", _format_percent(to_float(result.context.features.get("context_confidence"), 0.0)), help=HELP_TEXT["context_confidence"])
 
-    st.subheader("Technical Features")
-    st.dataframe(
-        pd.DataFrame(
-            _indicator_rows(to_serializable(result.features.indicators))
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
+    if result.context.reasons_to_trade:
+        st.success("Reasons to trade: " + "; ".join(result.context.reasons_to_trade))
+    if result.context.reasons_to_skip:
+        st.warning("Reasons to skip: " + "; ".join(result.context.reasons_to_skip))
+
+    with st.expander("Context Details", expanded=False):
+        context_metrics = {
+            "sentiment": result.context.sentiment,
+            **result.context.features,
+        }
+        context_metrics = _percent_context_metrics(context_metrics)
+        st.dataframe(pd.DataFrame([context_metrics]), use_container_width=True, hide_index=True, column_config=_context_column_config())
+        if result.context.catalysts:
+            st.write("Catalysts")
+            st.write(result.context.catalysts)
+        if result.context.risks:
+            st.write("Risks")
+            st.write(result.context.risks)
 
 
 def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan=None, ma_windows: list[int] | None = None):
@@ -315,14 +500,14 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
 
 def _render_scanner_filters(df: pd.DataFrame, settings) -> pd.DataFrame:
     defaults = settings.raw.get("scanner", {}).get("default_filters", {})
-    with st.expander("Scanner Filters", expanded=False):
+    with st.expander("Filters", expanded=False):
         st.caption("Min abs change and Max ATR are in percent. Min RVOL is the volume ratio (1.0 = average).")
         c1, c2, c3, c4 = st.columns(4)
-        min_abs_change = c1.slider("Min abs change", 0.0, 20.0, float(defaults.get("min_abs_change_pct", 0.0)) * 100, 0.5, format="%.1f%%")
-        min_rvol = c2.slider("Min RVOL", 0.0, 10.0, float(defaults.get("min_volume_anomaly", 0.0)), 0.25)
-        max_atr = c3.slider("Max ATR", 0.0, 50.0, float(defaults.get("max_atr_pct", 0.50)) * 100, 1.0, format="%.0f%%")
+        min_abs_change = c1.slider("Min abs change", 0.0, 20.0, float(defaults.get("min_abs_change_pct", 0.0)) * 100, 0.5, format="%.1f%%", help="Minimum absolute price move. Raise this to focus only on stocks that are moving.")
+        min_rvol = c2.slider("Min RVOL", 0.0, 10.0, float(defaults.get("min_volume_anomaly", 0.0)), 0.25, help=HELP_TEXT["avg_rvol"])
+        max_atr = c3.slider("Max ATR", 0.0, 50.0, float(defaults.get("max_atr_pct", 0.50)) * 100, 1.0, format="%.0f%%", help=HELP_TEXT["atr_pct"])
         actions = sorted(df["action"].dropna().unique().tolist()) if "action" in df else []
-        selected_actions = c4.multiselect("Actions", actions, default=actions)
+        selected_actions = c4.multiselect("Actions", actions, default=actions, help=HELP_TEXT["action"])
     filtered = df.copy()
     if "change_pct" in filtered:
         filtered = filtered[filtered["change_pct"].abs() >= min_abs_change]
@@ -352,6 +537,13 @@ def _risk_plan_row(plan) -> dict:
         "liquidity_ok": plan.liquidity_ok,
         "setup_quality": plan.setup_quality,
         "invalidation": plan.invalidation,
+    }
+
+
+def _trade_plan_column_config() -> dict:
+    return {
+        "field": st.column_config.TextColumn("Field", help="Part of the proposed trade plan."),
+        "value": st.column_config.TextColumn("Value", help="Read each plan field together; no single value is a trade instruction."),
     }
 
 
@@ -393,8 +585,40 @@ def _indicator_rows(indicators: dict) -> list[dict[str, str]]:
             display = f"{value:,.3f}"
         else:
             display = str(value)
-        rows.append({"name": key, "value": display})
+        rows.append({"name": _indicator_label(key), "value": display})
     return rows
+
+
+def _indicator_label(key: str) -> str:
+    labels = {
+        "price_change_pct": "Price Change",
+        "range_pct": "Range",
+        "vwap": "VWAP",
+        "rsi": "RSI",
+        "macd": "MACD",
+        "macd_signal": "MACD Signal",
+        "macd_hist": "MACD Histogram",
+        "atr": "ATR",
+        "atr_pct": "ATR %",
+        "avg_volume": "Average Volume",
+        "volume_anomaly": "Relative Volume",
+        "gap_pct": "Gap",
+        "session_open": "Session Open",
+        "session_high": "Session High",
+        "session_low": "Session Low",
+        "prior_high": "Prior High",
+        "prior_low": "Prior Low",
+        "prior_close": "Prior Close",
+        "opening_range_high": "Opening Range High",
+        "opening_range_low": "Opening Range Low",
+        "opening_range_status": "Opening Range Status",
+        "market_regime": "Market Regime",
+        "benchmark_change_pct": "Benchmark Change",
+        "relative_strength_pct": "Relative Strength",
+    }
+    if key.startswith("sma_"):
+        return key.replace("sma_", "SMA ")
+    return labels.get(key, _humanize_key(key))
 
 
 def _format_price_range(value: tuple[float, float] | list[float] | None) -> str:
@@ -408,42 +632,47 @@ def _format_targets(values: list[float]) -> str:
 
 
 def _render_symbol_sidebar(settings) -> list[str]:
-    st.sidebar.subheader("Selected Symbols")
+    st.sidebar.subheader("Symbols")
     if "selected_symbols_text" not in st.session_state:
         st.session_state.selected_symbols_text = ", ".join(settings.watchlist())
+    if "loaded_watchlist_name" not in st.session_state:
+        st.session_state.loaded_watchlist_name = settings.dashboard.get("default_watchlist", "default")
 
     watchlists = settings.raw.get("watchlists", {})
     watchlist_names = list(watchlists.keys()) or ["default"]
     watchlist_name = st.sidebar.selectbox(
-        "Load watchlist",
+        "Watchlist preset",
         options=watchlist_names,
         index=watchlist_names.index(settings.dashboard.get("default_watchlist", "default"))
         if settings.dashboard.get("default_watchlist", "default") in watchlists
         else 0,
+        help="Choose a configured watchlist. Changing it replaces the selected symbols box.",
     )
-    col1, col2 = st.sidebar.columns(2)
-    if col1.button("Use"):
+    if watchlist_name != st.session_state.loaded_watchlist_name:
         st.session_state.selected_symbols_text = ", ".join(settings.watchlist(watchlist_name))
-    if col2.button("Clear"):
+        st.session_state.loaded_watchlist_name = watchlist_name
+
+    if st.sidebar.button("Clear selected symbols", help="Remove all currently selected symbols from scan/news/backtest defaults."):
         st.session_state.selected_symbols_text = ""
 
-    lookup_query = st.sidebar.text_input("Find ticker", placeholder="AAPL, BRK.B, Palantir, Nvidia")
+    lookup_query = st.sidebar.text_input("Search symbol", placeholder="AAPL, BRK.B, Palantir, Nvidia", help="Find a ticker by symbol or company name, then add it to the selected list.")
     lookup_results = search_symbols(lookup_query, limit=12) if lookup_query else []
     if lookup_results:
         result_options = [f"{item['symbol']} - {item['name']}" for item in lookup_results]
-        selected_lookup = st.sidebar.selectbox("Matches", options=result_options)
-        if st.sidebar.button("Add match"):
+        selected_lookup = st.sidebar.selectbox("Search results", options=result_options)
+        if st.sidebar.button("Add selected symbol", help="Append the selected search result to the symbol list."):
             _append_symbol_to_state(selected_lookup.split(" - ", 1)[0])
     elif lookup_query:
         direct = normalize_symbol(lookup_query)
-        if st.sidebar.button(f"Add {direct} directly"):
+        if st.sidebar.button(f"Add {direct}", help="Add this direct ticker even if it was not found in the local search index."):
             _append_symbol_to_state(direct)
 
     st.sidebar.text_area(
-        "Tickers to analyze",
+        "Selected symbols",
         key="selected_symbols_text",
         height=96,
         placeholder="AAPL, NVDA, PLTR, SOFI",
+        help="Comma- or newline-separated symbols used by scanner, news, backtest, and default trade-plan symbol.",
     )
     symbols = clean_symbol_list(_parse_symbols(st.session_state.selected_symbols_text))
     st.sidebar.caption(f"{len(symbols)} selected: {', '.join(symbols[:8])}{'...' if len(symbols) > 8 else ''}")
@@ -456,10 +685,26 @@ def _append_symbol_to_state(symbol: str) -> None:
 
 
 def _render_news(settings, symbols: list[str]) -> None:
-    selected = st.multiselect("News symbols", options=symbols, default=symbols[: min(5, len(symbols))])
-    headline_limit = st.slider("Headline limit", min_value=5, max_value=100, value=50, step=5)
-    if st.button("Refresh News", type="primary"):
-        feed = build_news_feed(selected or symbols, settings, limit=headline_limit)
+    _render_news_capability_note(settings)
+    selected = st.multiselect("Symbols", options=symbols, default=symbols[: min(5, len(symbols))], help="Symbols to fetch and summarize news for.")
+    headline_limit = st.slider("Max headlines", min_value=5, max_value=100, value=50, step=5, help="Maximum headline rows returned to the table. Per-symbol summaries still obey the per-symbol config limit.")
+    if st.button("Refresh News", type="primary", help="Fetch configured news sources, optional article excerpts, and LLM summaries."):
+        progress = st.progress(0, text="Starting news refresh")
+        status = st.empty()
+
+        def update_progress(value: float, message: str) -> None:
+            status.caption(message)
+            progress.progress(float(value), text=message)
+
+        try:
+            feed = build_news_feed(selected or symbols, settings, limit=headline_limit, progress_callback=update_progress)
+        except NewsAnalysisError as exc:
+            progress.empty()
+            status.empty()
+            st.error(str(exc))
+            st.info("Start LocalDeploy on the configured endpoint or enable llm.fallback_to_heuristic in the config.")
+            return
+        progress.progress(1.0, text="News feed ready")
         items = feed["headlines"]
         if not items:
             st.info("No recent headlines returned by the configured free provider.")
@@ -469,38 +714,137 @@ def _render_news(settings, symbols: list[str]) -> None:
         bearish = int((df["sentiment"] == "bearish").sum()) if "sentiment" in df else 0
         neutral = len(df) - bullish - bearish
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Headlines", len(df))
-        c2.metric("Bullish", bullish)
-        c3.metric("Bearish", bearish)
-        c4.metric("Neutral", neutral)
-        c5.metric("Analysis", feed["analysis_provider"])
+        c1.metric("Headlines", len(df), help="Number of headline rows returned after configured limits.")
+        c2.metric("Bullish", bullish, help="Headlines classified as directionally positive.")
+        c3.metric("Bearish", bearish, help="Headlines classified as directionally negative.")
+        c4.metric("Neutral", neutral, help="Headlines without a clear directional tilt.")
+        c5.metric("Analysis", feed["analysis_provider"], help=HELP_TEXT["analysis_provider"])
+        _render_news_coverage(feed.get("coverage", {}))
+        provider_label = str(feed.get("analysis_provider", ""))
+        if "heuristic_fallback" in provider_label:
+            st.warning("LLM summarization failed; this feed is using heuristic fallback summaries.")
+        elif provider_label == "heuristic":
+            st.info("LLM summarization is disabled; this feed is using heuristic summaries.")
 
-        st.subheader("Grand Summary By Stock")
+        st.subheader("Stock News Summary")
         for summary in feed["summaries"]:
             _render_symbol_news_summary(summary)
 
-        st.subheader("All Headlines")
+        st.subheader("Headline Table")
         st.dataframe(
             df[["symbol", "category", "sentiment", "impact", "day_trader_relevance", "published", "provider", "title", "url"]],
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "impact": st.column_config.NumberColumn("Impact", format="%.2f"),
-                "day_trader_relevance": st.column_config.NumberColumn("Relevance", format="%.2f"),
-                "url": st.column_config.LinkColumn("Link"),
-            },
+            column_config=_headline_column_config(),
         )
+
+
+def _render_backtest(settings, symbols: list[str]) -> None:
+    st.subheader("Backtest")
+    selected_symbols = symbols or settings.watchlist()
+    st.caption(f"Symbols: {', '.join(selected_symbols[:12])}{'...' if len(selected_symbols) > 12 else ''}")
+    with st.expander("Simulation Settings", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"field": "Initial capital", "value": _format_price(float(settings.backtest.get("initial_capital", 0)))},
+                    {"field": "Holding period", "value": f"{settings.backtest.get('holding_period_days', '-')} days"},
+                    {"field": "Evaluation step", "value": f"{settings.backtest.get('evaluation_step_days', '-')} days"},
+                    {"field": "Slippage", "value": f"{settings.backtest.get('slippage_bps', '-')} bps"},
+                    {"field": "Commission", "value": _format_price(float(settings.backtest.get("commission_per_trade", 0)))},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    if st.button("Run Backtest On Selected Symbols", type="primary", help="Run historical simulation using the selected symbols and current config. Treat results as a logic check, not proof of future edge."):
+        with st.spinner("Running historical simulation"):
+            report = run_backtest(settings, symbols=symbols or None)
+        report_df = pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"])
+        report_df = _percent_display(report_df, ["win_rate", "average_return", "max_drawdown", "no_trade_rate"])
+        st.dataframe(
+            report_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_backtest_column_config(),
+        )
+        if report.equity_curve:
+            equity_df = pd.DataFrame(report.equity_curve)
+            st.line_chart(equity_df.set_index("date")["equity"])
+        if report.trade_log:
+            with st.expander("Trade Log", expanded=True):
+                trade_log_df = _percent_display(
+                    pd.DataFrame(report.trade_log),
+                    ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
+                )
+                st.dataframe(trade_log_df, use_container_width=True, hide_index=True, column_config=_trade_log_column_config())
+
+
+def _render_settings_tab(settings, symbols: list[str]) -> None:
+    st.subheader("Runtime Settings")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Data", str(settings.data.get("provider", "-")), help="Configured market data provider.")
+    c2.metric("Period", f"{settings.data.get('period', '-')}/{settings.data.get('interval', '-')}", help="Historical period and bar interval used by default daily analysis.")
+    c3.metric("Models", ", ".join(settings.enabled_models()) or "none", help="Prediction models currently enabled in config.")
+    c4.metric("Symbols", len(symbols), help="Number of selected symbols in the sidebar.")
+
+    sections = [
+        {"section": "Config file", "value": str(settings.path)},
+        {"section": "Context sources", "value": ", ".join(str(source) for source in settings.context_agent.get("sources", [])) or "none"},
+        {"section": "News LLM", "value": _settings_llm_summary(settings)},
+        {"section": "Risk per trade", "value": _format_percent(float(settings.risk.get("max_risk_per_trade_pct", 0)))},
+        {"section": "Min risk/reward", "value": str(settings.risk.get("min_risk_reward", "-"))},
+        {"section": "Selected symbols", "value": ", ".join(symbols) or "-"},
+    ]
+    st.dataframe(pd.DataFrame(sections), use_container_width=True, hide_index=True)
+
+    with st.expander("Advanced Raw Config", expanded=False):
+        st.json(to_serializable(settings.raw))
+
+
+def _settings_llm_summary(settings) -> str:
+    llm = settings.context_agent.get("news_analysis", {}).get("llm", {})
+    enabled = "enabled" if llm.get("enabled", False) else "disabled"
+    return f"{enabled} ({llm.get('provider', 'heuristic')})"
+
+
+def _render_news_capability_note(settings) -> None:
+    llm_cfg = settings.context_agent.get("news_analysis", {}).get("llm", {})
+    scrape_cfg = settings.context_agent.get("news_analysis", {}).get("article_scraping", {})
+    sources = ", ".join(str(source) for source in settings.context_agent.get("sources", [])) or "none"
+    llm_status = "enabled" if llm_cfg.get("enabled", False) else "disabled"
+    provider = str(llm_cfg.get("provider", "heuristic"))
+    fallback = "enabled" if llm_cfg.get("fallback_to_heuristic", True) else "disabled"
+    scraping = "enabled" if scrape_cfg.get("enabled", False) else "disabled"
+    with st.expander("News coverage and limits", expanded=False):
+        st.write(
+            "This feed aggregates configured headline metadata and provider links. "
+            "When article scraping is enabled, it fetches a short article excerpt for the LLM; it does not store full article bodies."
+        )
+        st.write(f"Configured sources: {sources}. LLM summarizer: {llm_status} ({provider}). Heuristic fallback: {fallback}. Article excerpts: {scraping}.")
+        st.write("If fallback is disabled and the configured LLM endpoint is unavailable, the News tab stops instead of producing a heuristic summary.")
+
+
+def _render_news_coverage(coverage: dict) -> None:
+    if not coverage:
+        return
+    sources = ", ".join(coverage.get("configured_sources", [])) or "none"
+    scrape_status = f"article excerpts ({coverage.get('article_excerpt_count', 0)} fetched)" if coverage.get("article_body_scraping") else "headline/link mode"
+    st.caption(
+        f"Coverage: {sources}; LLM provider: {coverage.get('llm_provider', 'heuristic')}; "
+        f"fallback: {'enabled' if coverage.get('fallback_to_heuristic') else 'disabled'}; mode: {scrape_status}."
+    )
 
 
 def _render_symbol_news_summary(summary: dict) -> None:
     st.markdown(f"### {summary['symbol']}")
     st.write(summary.get("grand_summary", "No summary available."))
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Sources", summary.get("source_count", 0))
-    c2.metric("Headlines", summary.get("headline_count", 0))
-    c3.metric("Bullish", summary.get("bullish_count", 0))
-    c4.metric("Bearish", summary.get("bearish_count", 0))
-    c5.metric("Category", str(summary.get("dominant_category", "other")).replace("_", " "))
+    c1.metric("Sources", summary.get("source_count", 0), help=HELP_TEXT["news_sources"])
+    c2.metric("Headlines", summary.get("headline_count", 0), help="Number of headlines used for this symbol summary.")
+    c3.metric("Bullish", summary.get("bullish_count", 0), help="Count of headlines classified as positive for this symbol.")
+    c4.metric("Bearish", summary.get("bearish_count", 0), help="Count of headlines classified as negative for this symbol.")
+    c5.metric("Category", str(summary.get("dominant_category", "other")).replace("_", " "), help="Most common catalyst/category in the selected headlines.")
 
     focus = summary.get("day_trader_focus", {})
     st.dataframe(
@@ -514,10 +858,21 @@ def _render_symbol_news_summary(summary: dict) -> None:
         ),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "question": st.column_config.TextColumn("Question", help="Trader question the news summary is trying to answer."),
+            "answer": st.column_config.TextColumn("Answer", help="LLM or heuristic summary for this decision question."),
+        },
     )
+    if summary.get("analysis_provider"):
+        st.caption(f"Summary provider: {summary.get('analysis_provider')}")
+    if summary.get("analysis_provider") == "heuristic_fallback":
+        st.warning(f"Heuristic fallback summary. LLM error: {summary.get('llm_error', 'unknown error')}")
+    if summary.get("llm_notes"):
+        st.write("LLM notes")
+        st.write(summary.get("llm_notes"))
 
     sources = pd.DataFrame(summary.get("sources", []))
-    with st.expander(f"{summary.get('source_count', 0)} linked sources"):
+    with st.expander(f"Open {summary.get('source_count', 0)} linked sources"):
         if sources.empty:
             st.info("No linked sources were returned.")
         else:
@@ -526,11 +881,22 @@ def _render_symbol_news_summary(summary: dict) -> None:
                 sources[columns],
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "impact": st.column_config.NumberColumn("Impact", format="%.2f"),
-                    "url": st.column_config.LinkColumn("Link"),
-                },
+                column_config=_headline_column_config(),
             )
+
+
+def _headline_column_config() -> dict:
+    return {
+        "symbol": st.column_config.TextColumn("Symbol", help="Ticker associated with the headline."),
+        "category": st.column_config.TextColumn("Category", help="Catalyst type detected from the headline and excerpt."),
+        "sentiment": st.column_config.TextColumn("Sentiment", help=HELP_TEXT["sentiment"]),
+        "impact": st.column_config.NumberColumn("Impact", format="%.2f", help=HELP_TEXT["impact"]),
+        "day_trader_relevance": st.column_config.NumberColumn("Relevance", format="%.2f", help=HELP_TEXT["headline_relevance"]),
+        "published": st.column_config.TextColumn("Published", help="Timestamp returned by the news provider when available."),
+        "provider": st.column_config.TextColumn("Provider", help="Source provider that returned the item."),
+        "title": st.column_config.TextColumn("Title", help="Headline used for catalyst and sentiment analysis."),
+        "url": st.column_config.LinkColumn("Link", help="Source link for manual review."),
+    }
 
 
 _JOURNAL_SETUPS = ["opening_range_break", "vwap_reclaim", "vwap_loss", "trend_pullback", "gap_and_go", "reversal", "news_catalyst", "other"]
@@ -545,17 +911,17 @@ def _render_journal(settings, symbols: list[str]) -> None:
     recent = load_journal_entries(settings, limit=100)
     with st.form("journal_form"):
         c1, c2, c3, c4 = st.columns(4)
-        symbol = c1.text_input("Symbol", value=(symbols[0] if symbols else str(settings.dashboard.get("default_symbol", "AAPL")))).upper()
-        action = c2.selectbox("Action", _JOURNAL_ACTIONS)
-        setup_type = c3.selectbox("Setup", _JOURNAL_SETUPS)
-        outcome = c4.selectbox("Outcome", _JOURNAL_OUTCOMES)
+        symbol = c1.text_input("Symbol", value=(symbols[0] if symbols else str(settings.dashboard.get("default_symbol", "AAPL"))), help="Ticker reviewed in this journal entry.").upper()
+        action = c2.selectbox("Action", _JOURNAL_ACTIONS, help="The action you took or the system suggested.")
+        setup_type = c3.selectbox("Setup", _JOURNAL_SETUPS, help="The setup pattern you were evaluating.")
+        outcome = c4.selectbox("Outcome", _JOURNAL_OUTCOMES, help="Final or current result of the idea.")
         c5, c6, c7, c8 = st.columns(4)
-        followed_plan = c5.checkbox("Followed plan")
-        risk_respected = c6.checkbox("Risk respected")
-        entry_quality = c7.slider("Entry quality", 1, 5, 3)
-        exit_quality = c8.slider("Exit quality", 1, 5, 3)
-        emotional_state = st.selectbox("State", _JOURNAL_STATES)
-        notes = st.text_area("Notes")
+        followed_plan = c5.checkbox("Followed plan", help="Check this only if entry/exit followed the written plan.")
+        risk_respected = c6.checkbox("Risk respected", help="Check this only if position size and stop respected your risk limits.")
+        entry_quality = c7.slider("Entry quality", 1, 5, 3, help="Rate whether the entry was patient, level-based, and not chased.")
+        exit_quality = c8.slider("Exit quality", 1, 5, 3, help="Rate whether the exit followed stop/target/invalidation rules.")
+        emotional_state = st.selectbox("State", _JOURNAL_STATES, help="Mental state can explain bad process even when the P/L looks fine.")
+        notes = st.text_area("Notes", help="Write what mattered: catalyst, entry reason, stop, target, mistake, or lesson.")
         submitted = st.form_submit_button("Save Review")
     if submitted:
         record = append_journal_entry(
@@ -690,89 +1056,142 @@ def _format_percent(value: float | None) -> str:
     return "-" if value is None else f"{float(value) * 100:.2f}%"
 
 
-def _scanner_column_config() -> dict:
-    return {
-        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
-        "change_pct": st.column_config.NumberColumn("Change", format="%.2f%%"),
-        "volume_anomaly": st.column_config.NumberColumn("RVOL", format="%.2f"),
-        "gap_pct": st.column_config.NumberColumn("Gap", format="%.2f%%"),
-        "atr_pct": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
-        "prior_high": st.column_config.NumberColumn("Prior High", format="$%.2f"),
-        "prior_low": st.column_config.NumberColumn("Prior Low", format="$%.2f"),
-        "session_open": st.column_config.NumberColumn("Open", format="$%.2f"),
-        "opening_range_high": st.column_config.NumberColumn("OR High", format="$%.2f"),
-        "opening_range_low": st.column_config.NumberColumn("OR Low", format="$%.2f"),
-        "extension_from_vwap_pct": st.column_config.NumberColumn("VWAP Dist", format="%.2f%%"),
-        "distance_to_support_pct": st.column_config.NumberColumn("Support Dist", format="%.2f%%"),
-        "distance_to_resistance_pct": st.column_config.NumberColumn("Resistance Dist", format="%.2f%%"),
-        "benchmark_change_pct": st.column_config.NumberColumn("Benchmark", format="%.2f%%"),
-        "relative_strength_pct": st.column_config.NumberColumn("Rel Strength", format="%.2f%%"),
-        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
-        "score": st.column_config.NumberColumn("Score", format="%.3f"),
-        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
-        "rank_score": st.column_config.NumberColumn("Rank", format="%.3f"),
+def _humanize_key(key: str) -> str:
+    return key.replace("_", " ").title()
+
+
+def _format_scanner_value(key: str, value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    percent_keys = {
+        "change_pct",
+        "gap_pct",
+        "atr_pct",
+        "confidence",
+        "extension_from_vwap_pct",
+        "distance_to_support_pct",
+        "distance_to_resistance_pct",
+        "benchmark_change_pct",
+        "relative_strength_pct",
     }
+    price_keys = {"price", "prior_high", "prior_low", "session_open", "opening_range_high", "opening_range_low"}
+    volume_keys = {"volume", "avg_volume"}
+    if key in percent_keys:
+        return f"{float(value):.2f}%"
+    if key in price_keys:
+        return _format_price(float(value))
+    if key in volume_keys:
+        return f"{float(value):,.0f}"
+    if key in {"volume_anomaly", "risk_reward"}:
+        return f"{float(value):.2f}"
+    if key in {"rank_score", "score"}:
+        return f"{float(value):.3f}"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _scanner_column_config(compact: bool = False) -> dict:
+    config = {
+        "symbol": st.column_config.TextColumn("Symbol", width="small", help="Ticker being evaluated."),
+        "action": st.column_config.TextColumn("Action", width="small", help=HELP_TEXT["action"]),
+        "price": st.column_config.NumberColumn("Price", format="$%.2f", help="Latest price used by the scanner row."),
+        "change_pct": st.column_config.NumberColumn("Change", format="%.2f%%", help="Current percent move. Large moves can create opportunity, but also late-entry risk."),
+        "volume_anomaly": st.column_config.NumberColumn("RVOL", format="%.2f", help="Relative volume. Above 1.0 means volume is above recent average."),
+        "gap_pct": st.column_config.NumberColumn("Gap", format="%.2f%%", help=HELP_TEXT["gap_pct"]),
+        "atr_pct": st.column_config.NumberColumn("ATR %", format="%.2f%%", help=HELP_TEXT["atr_pct"]),
+        "prior_high": st.column_config.NumberColumn("Prior High", format="$%.2f", help="Previous bar/session high used as a reference level."),
+        "prior_low": st.column_config.NumberColumn("Prior Low", format="$%.2f", help="Previous bar/session low used as a reference level."),
+        "session_open": st.column_config.NumberColumn("Open", format="$%.2f", help="Current session open."),
+        "opening_range_high": st.column_config.NumberColumn("OR High", format="$%.2f", help="High of the configured opening range."),
+        "opening_range_low": st.column_config.NumberColumn("OR Low", format="$%.2f", help="Low of the configured opening range."),
+        "extension_from_vwap_pct": st.column_config.NumberColumn("VWAP Dist", format="%.2f%%", help="Distance from VWAP. Large extension can make entries riskier."),
+        "distance_to_support_pct": st.column_config.NumberColumn("Support Dist", format="%.2f%%", help="Distance to nearest support. Too far from support can widen stop risk."),
+        "distance_to_resistance_pct": st.column_config.NumberColumn("Resistance Dist", format="%.2f%%", help="Distance to nearest resistance. Nearby resistance can cap upside."),
+        "benchmark_change_pct": st.column_config.NumberColumn("Benchmark", format="%.2f%%", help="Move in the configured benchmark, usually SPY."),
+        "relative_strength_pct": st.column_config.NumberColumn("Rel Strength", format="%.2f%%", help=HELP_TEXT["relative_strength"]),
+        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%", help=HELP_TEXT["confidence"]),
+        "score": st.column_config.NumberColumn("Score", format="%.3f", help=HELP_TEXT["score"]),
+        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f", help=HELP_TEXT["risk_reward"]),
+        "rank_score": st.column_config.NumberColumn("Rank", format="%.3f", help=HELP_TEXT["rank"]),
+        "top_reason": st.column_config.TextColumn("Why", width="medium", help=HELP_TEXT["top_reason"]),
+    }
+    if compact:
+        compact_keys = {
+            "symbol",
+            "action",
+            "rank_score",
+            "confidence",
+            "price",
+            "change_pct",
+            "volume_anomaly",
+            "gap_pct",
+            "relative_strength_pct",
+            "top_reason",
+        }
+        return {key: value for key, value in config.items() if key in compact_keys}
+    return config
 
 
 def _model_column_config() -> dict:
     return {
-        "expected_return": st.column_config.NumberColumn("Expected Return", format="%.2f%%"),
-        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
-        "predicted_price": st.column_config.NumberColumn("Predicted", format="$%.2f"),
-        "lower_bound": st.column_config.NumberColumn("Lower", format="$%.2f"),
-        "upper_bound": st.column_config.NumberColumn("Upper", format="$%.2f"),
+        "expected_return": st.column_config.NumberColumn("Expected Return", format="%.2f%%", help="Model-implied return over the configured horizon."),
+        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%", help=HELP_TEXT["confidence"]),
+        "predicted_price": st.column_config.NumberColumn("Predicted", format="$%.2f", help="Model-implied future price estimate."),
+        "lower_bound": st.column_config.NumberColumn("Lower", format="$%.2f", help="Lower uncertainty bound when the model supplies one."),
+        "upper_bound": st.column_config.NumberColumn("Upper", format="$%.2f", help="Upper uncertainty bound when the model supplies one."),
     }
 
 
 def _risk_column_config() -> dict:
     return {
-        "entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
-        "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f"),
-        "stop_source": st.column_config.TextColumn("Stop anchor"),
-        "target_source": st.column_config.TextColumn("Target anchor"),
-        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
-        "risk_per_share": st.column_config.NumberColumn("Risk/Share", format="$%.2f"),
-        "planned_risk": st.column_config.NumberColumn("Planned Risk", format="$%.2f"),
-        "planned_position_value": st.column_config.NumberColumn("Position Value", format="$%.2f"),
-        "max_position_risk": st.column_config.NumberColumn("Max Risk", format="$%.2f"),
+        "entry": st.column_config.NumberColumn("Entry", format="$%.2f", help=HELP_TEXT["entry"]),
+        "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f", help=HELP_TEXT["stop"]),
+        "stop_source": st.column_config.TextColumn("Stop anchor", help="Why this stop level was selected, such as support, VWAP, or ATR fallback."),
+        "target_source": st.column_config.TextColumn("Target anchor", help="Why this target level was selected, such as R-multiple or structural resistance/support."),
+        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f", help=HELP_TEXT["risk_reward"]),
+        "risk_per_share": st.column_config.NumberColumn("Risk/Share", format="$%.2f", help="Entry minus stop for longs, or stop minus entry for shorts."),
+        "planned_risk": st.column_config.NumberColumn("Planned Risk", format="$%.2f", help="Dollar risk implied by position size and stop distance."),
+        "planned_position_value": st.column_config.NumberColumn("Position Value", format="$%.2f", help="Approximate notional value of the planned position."),
+        "max_position_risk": st.column_config.NumberColumn("Max Risk", format="$%.2f", help="Configured maximum account risk for this trade."),
     }
 
 
 def _context_column_config() -> dict:
     return {
-        "context_confidence": st.column_config.NumberColumn("Context Confidence", format="%.1f%%"),
-        "catalyst_score": st.column_config.NumberColumn("Catalyst Score", format="%.2f"),
-        "catalyst_freshness": st.column_config.NumberColumn("Freshness", format="%.1f%%"),
-        "market_alignment": st.column_config.NumberColumn("Market Alignment", format="%.2f"),
-        "sector_alignment": st.column_config.NumberColumn("Sector Alignment", format="%.2f"),
+        "context_confidence": st.column_config.NumberColumn("Context Confidence", format="%.1f%%", help=HELP_TEXT["context_confidence"]),
+        "catalyst_score": st.column_config.NumberColumn("Catalyst Score", format="%.2f", help=HELP_TEXT["catalyst_score"]),
+        "catalyst_freshness": st.column_config.NumberColumn("Freshness", format="%.1f%%", help=HELP_TEXT["freshness"]),
+        "market_alignment": st.column_config.NumberColumn("Market Alignment", format="%.2f", help="Whether broad-market context supports the setup."),
+        "sector_alignment": st.column_config.NumberColumn("Sector Alignment", format="%.2f", help="Whether sector movement supports the symbol setup."),
     }
 
 
 def _backtest_column_config() -> dict:
     return {
-        "win_rate": st.column_config.NumberColumn("Win Rate", format="%.2f%%"),
-        "average_return": st.column_config.NumberColumn("Avg Return", format="%.2f%%"),
-        "max_drawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%"),
-        "sharpe_like": st.column_config.NumberColumn("Sharpe-like", format="%.2f"),
-        "no_trade_rate": st.column_config.NumberColumn("No Trade", format="%.2f%%"),
+        "win_rate": st.column_config.NumberColumn("Win Rate", format="%.2f%%", help=HELP_TEXT["backtest_win_rate"]),
+        "average_return": st.column_config.NumberColumn("Avg Return", format="%.2f%%", help=HELP_TEXT["backtest_average_return"]),
+        "max_drawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%", help=HELP_TEXT["drawdown"]),
+        "sharpe_like": st.column_config.NumberColumn("Sharpe-like", format="%.2f", help=HELP_TEXT["backtest_sharpe_like"]),
+        "no_trade_rate": st.column_config.NumberColumn("No Trade", format="%.2f%%", help=HELP_TEXT["backtest_no_trade_rate"]),
     }
 
 
 def _trade_log_column_config() -> dict:
     return {
-        "entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
-        "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f"),
-        "target": st.column_config.NumberColumn("Target", format="$%.2f"),
-        "exit_price": st.column_config.NumberColumn("Exit", format="$%.2f"),
-        "return": st.column_config.NumberColumn("Return", format="%.2f%%"),
-        "trade_return": st.column_config.NumberColumn("Trade Return", format="%.2f%%"),
-        "r_multiple": st.column_config.NumberColumn("R", format="%.2f"),
-        "max_adverse_excursion": st.column_config.NumberColumn("MAE", format="%.2f%%"),
-        "max_favorable_excursion": st.column_config.NumberColumn("MFE", format="%.2f%%"),
-        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
-        "score": st.column_config.NumberColumn("Score", format="%.3f"),
-        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f"),
-        "equity": st.column_config.NumberColumn("Equity", format="$%.2f"),
+        "entry": st.column_config.NumberColumn("Entry", format="$%.2f", help=HELP_TEXT["entry"]),
+        "stop_loss": st.column_config.NumberColumn("Stop", format="$%.2f", help=HELP_TEXT["stop"]),
+        "target": st.column_config.NumberColumn("Target", format="$%.2f", help=HELP_TEXT["target"]),
+        "exit_price": st.column_config.NumberColumn("Exit", format="$%.2f", help="Simulated exit price after stop, target, or time exit."),
+        "return": st.column_config.NumberColumn("Return", format="%.2f%%", help="Return for the simulated evaluation period."),
+        "trade_return": st.column_config.NumberColumn("Trade Return", format="%.2f%%", help="Position return after simulated exit and costs."),
+        "r_multiple": st.column_config.NumberColumn("R", format="%.2f", help="Return measured in units of planned risk. 1R means reward equals initial risk."),
+        "max_adverse_excursion": st.column_config.NumberColumn("MAE", format="%.2f%%", help=HELP_TEXT["mae"]),
+        "max_favorable_excursion": st.column_config.NumberColumn("MFE", format="%.2f%%", help=HELP_TEXT["mfe"]),
+        "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%", help=HELP_TEXT["confidence"]),
+        "score": st.column_config.NumberColumn("Score", format="%.3f", help=HELP_TEXT["score"]),
+        "risk_reward": st.column_config.NumberColumn("R/R", format="%.2f", help=HELP_TEXT["risk_reward"]),
+        "equity": st.column_config.NumberColumn("Equity", format="$%.2f", help="Simulated account equity after this trade/evaluation."),
     }
 
 

@@ -145,7 +145,13 @@ context_agent:
       timeout_seconds: 120
       max_output_tokens: 700
       temperature: 0.1
-      fallback_to_heuristic: true
+      fallback_to_heuristic: false
+    article_scraping:
+      enabled: true
+      max_articles_per_symbol: 3
+      timeout_seconds: 8
+      max_chars_per_article: 1400
+      user_agent: StockPredictor research crawler/0.1
 
 backtest:
   initial_capital: 100000

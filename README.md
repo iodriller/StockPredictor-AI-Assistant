@@ -156,8 +156,22 @@ with model/profile:
 qwen3vl_8b_ollama
 ```
 
-If LocalDeploy is not running, the app falls back to the built-in heuristic news
-classifier and summarizer.
+The local config can require LLM summaries by setting:
+
+```yaml
+context_agent:
+  news_analysis:
+    llm:
+      fallback_to_heuristic: false
+```
+
+When fallback is disabled and LocalDeploy is unavailable, the News tab reports
+the LLM error instead of silently producing a heuristic summary. When fallback
+is enabled, the UI labels the result as `heuristic_fallback`.
+
+Optional article excerpt fetching is configured under
+`context_agent.news_analysis.article_scraping`. The app fetches short article
+excerpts for summarization; it does not store full article bodies.
 
 Trader Agent
 ------------
