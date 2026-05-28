@@ -442,6 +442,18 @@ def test_horizon_profile_overrides_atr_multiple(tmp_path: Path) -> None:
     assert settings.horizon_profile("nonexistent")["atr_stop_multiple"] == 1.5  # falls back
 
 
+def test_missing_horizons_get_default_profiles(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw.pop("horizons", None)
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    assert {"intraday", "swing", "position"}.issubset(settings.horizons["profiles"])
+    assert settings.horizon_profile("intraday")["name"] == "intraday"
+    assert settings.horizon_profile("intraday")["horizon_days"] == 1
+
+
 def test_snapshots_persist_and_diff(tmp_path: Path) -> None:
     from stockpredictor.contracts import AnalysisResult, ContextSummary, FeatureSet, MarketSnapshot, RiskPlan, SessionContext, SignalDecision
     from stockpredictor.snapshots import diff_snapshots, load_snapshots, record_snapshot
@@ -486,7 +498,7 @@ def test_news_freshness_promotes_recent_items(tmp_path: Path, monkeypatch) -> No
     stale = (now - timedelta(hours=12)).isoformat()
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [
+        lambda symbols, limit=50, **kwargs: [
             {"symbol": "TEST", "title": "Old guidance recap", "url": "https://example.com/old", "published": stale, "impact": 0.4, "sentiment": "bullish"},
             {"symbol": "TEST", "title": "TEST raises guidance", "url": "https://example.com/new", "published": fresh, "impact": 0.5, "sentiment": "bullish"},
         ],

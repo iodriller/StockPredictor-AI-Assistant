@@ -116,6 +116,8 @@ context_agent:
   mind_file: traders.mind.md
   sources:
     - yfinance_news
+    - yahoo_search_news
+    - google_news_rss
     - manual
   manual_items:
     - source: default
@@ -124,8 +126,14 @@ context_agent:
       impact: 0.0
   news_analysis:
     enabled: true
-    max_headlines_per_symbol: 8
+    max_headlines_per_symbol: 50
     source_count_clickthrough: true
+    google_news_rss:
+      query_template: "{symbol} stock"
+      hl: en-US
+      gl: US
+      ceid: US:en
+      timeout_seconds: 10
     categories:
       - earnings_guidance
       - analyst_action

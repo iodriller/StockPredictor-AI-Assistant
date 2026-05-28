@@ -31,6 +31,30 @@ Run the dashboard:
 .\.venv\Scripts\python -m stockpredictor.cli dashboard --config configs/default.yaml
 ```
 
+Run the full local stack:
+
+```powershell
+.\scripts\start-local.ps1
+```
+
+This starts LocalDeploy on `8100` when the sibling `..\LocalDeploy` project is
+available, the FastAPI service on `8000`, and the dashboard on `8501`, then opens
+the dashboard. Logs and pid files are written to `.logs/`.
+
+By default the launcher refreshes StockPredictor API/dashboard processes so the
+dashboard cannot keep serving stale imports after code changes. Use
+`-ReuseExisting` only when you explicitly want to keep already-running
+StockPredictor processes.
+
+Stop the StockPredictor services:
+
+```powershell
+.\scripts\stop-local.ps1
+```
+
+Add `-IncludeLocalDeploy` if you also want to stop the LocalDeploy process
+started by the launcher.
+
 Analyze one symbol:
 
 ```powershell

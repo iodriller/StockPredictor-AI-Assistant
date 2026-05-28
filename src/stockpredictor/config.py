@@ -23,6 +23,39 @@ REQUIRED_SECTIONS = (
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "default.yaml"
 
+DEFAULT_HORIZONS: dict[str, Any] = {
+    "default": "swing",
+    "profiles": {
+        "intraday": {
+            "horizon_days": 1,
+            "lookback_rows": 30,
+            "atr_stop_multiple": 0.8,
+            "target_r_multiple": 1.5,
+            "entry_cushion_atr": 0.15,
+            "entry_cushion_pct": 0.0015,
+            "weights": {"models": 0.15, "technicals": 0.20, "intraday": 0.45, "context": 0.15, "sentiment": 0.05},
+        },
+        "swing": {
+            "horizon_days": 5,
+            "lookback_rows": 180,
+            "atr_stop_multiple": 1.5,
+            "target_r_multiple": 1.5,
+            "entry_cushion_atr": 0.25,
+            "entry_cushion_pct": 0.002,
+            "weights": {"models": 0.35, "technicals": 0.30, "intraday": 0.10, "context": 0.20, "sentiment": 0.05},
+        },
+        "position": {
+            "horizon_days": 20,
+            "lookback_rows": 252,
+            "atr_stop_multiple": 2.5,
+            "target_r_multiple": 2.5,
+            "entry_cushion_atr": 0.40,
+            "entry_cushion_pct": 0.004,
+            "weights": {"models": 0.45, "technicals": 0.30, "intraday": 0.0, "context": 0.20, "sentiment": 0.05},
+        },
+    },
+}
+
 
 class ConfigError(ValueError):
     pass
@@ -82,7 +115,25 @@ class Settings:
 
     @property
     def horizons(self) -> dict[str, Any]:
-        return self.raw.get("horizons", {})
+        configured = self.raw.get("horizons", {})
+        merged = {
+            "default": DEFAULT_HORIZONS["default"],
+            "profiles": {name: dict(profile) for name, profile in DEFAULT_HORIZONS["profiles"].items()},
+        }
+        if not isinstance(configured, dict):
+            return merged
+        if configured.get("default"):
+            merged["default"] = str(configured["default"]).lower()
+        configured_profiles = configured.get("profiles", {})
+        if isinstance(configured_profiles, dict):
+            for name, profile in configured_profiles.items():
+                if not isinstance(profile, dict):
+                    continue
+                key = str(name).lower()
+                base = dict(merged["profiles"].get(key, {}))
+                base.update(profile)
+                merged["profiles"][key] = base
+        return merged
 
     def horizon_profile(self, horizon: str | None = None) -> dict[str, Any]:
         """Return the configured horizon profile, with safe fallbacks if the section is absent."""

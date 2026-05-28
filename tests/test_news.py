@@ -8,14 +8,14 @@ from stockpredictor.config import load_settings
 from stockpredictor.context import fetch_news_items
 import pytest
 
-from stockpredictor.news import NewsAnalysisError, _call_openai_compatible_chat, _extract_article_text, _strip_json_fence, build_news_feed
+from stockpredictor.news import NewsAnalysisError, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, build_news_feed
 
 
 def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [
+        lambda symbols, limit=50, **kwargs: [
             {
                 "symbol": "TEST",
                 "title": "TEST raises guidance after earnings beat",
@@ -37,6 +37,32 @@ def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch
     assert feed["headlines"][0]["category"] == "earnings_guidance"
 
 
+def test_news_feed_uses_requested_limit_for_symbol_summary(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50, **kwargs: [
+            {
+                "symbol": "TEST",
+                "title": f"TEST headline {index}",
+                "provider": "Fixture News",
+                "published": "2026-01-01T09:30:00Z",
+                "url": f"https://example.com/test/{index}",
+                "impact": 0.0,
+                "sentiment": "neutral",
+            }
+            for index in range(limit)
+        ],
+    )
+
+    feed = build_news_feed(["TEST"], settings, limit=25)
+
+    assert feed["requested_headline_limit"] == 25
+    assert feed["returned_headline_count"] == 25
+    assert feed["summary_headline_limit_per_symbol"] == 25
+    assert feed["summaries"][0]["headline_count"] == 25
+
+
 def test_news_feed_can_use_localdeploy_llm(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
     raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
@@ -48,7 +74,7 @@ def test_news_feed_can_use_localdeploy_llm(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [
+        lambda symbols, limit=50, **kwargs: [
             {
                 "symbol": "TEST",
                 "title": "TEST shares jump after AI contract",
@@ -97,7 +123,7 @@ def test_news_feed_reports_heuristic_fallback_and_progress(tmp_path: Path, monke
 
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [
+        lambda symbols, limit=50, **kwargs: [
             {
                 "symbol": "TEST",
                 "title": "TEST shares move on product launch",
@@ -138,7 +164,7 @@ def test_news_feed_can_disable_heuristic_fallback(tmp_path: Path, monkeypatch) -
 
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [{"symbol": "TEST", "title": "TEST wins contract", "url": "https://example.com/test"}],
+        lambda symbols, limit=50, **kwargs: [{"symbol": "TEST", "title": "TEST wins contract", "url": "https://example.com/test"}],
     )
     monkeypatch.setattr(
         "stockpredictor.news._call_openai_compatible_chat",
@@ -147,6 +173,40 @@ def test_news_feed_can_disable_heuristic_fallback(tmp_path: Path, monkeypatch) -
 
     with pytest.raises(NewsAnalysisError):
         build_news_feed(["TEST"], settings, limit=10)
+
+
+def test_news_feed_keeps_multi_symbol_results_when_one_llm_summary_fails(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["context_agent"]["news_analysis"]["llm"]["enabled"] = True
+    raw["context_agent"]["news_analysis"]["llm"]["provider"] = "localdeploy"
+    raw["context_agent"]["news_analysis"]["llm"]["fallback_to_heuristic"] = False
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50, **kwargs: [
+            {"symbol": "GOOD", "title": "GOOD wins contract", "url": "https://example.com/good", "impact": 0.4, "sentiment": "bullish"},
+            {"symbol": "BAD", "title": "BAD reports delay", "url": "https://example.com/bad", "impact": -0.4, "sentiment": "bearish"},
+        ],
+    )
+
+    def fake_call(symbol, payload_items, news_cfg):
+        if symbol == "BAD":
+            raise RuntimeError("bad LLM response")
+        return {
+            "grand_summary": "GOOD summary",
+            "dominant_category": "product_business",
+            "day_trader_focus": {"catalyst": "contract", "risk": "none", "tradeability": "confirm", "no_trade_flags": []},
+        }
+
+    monkeypatch.setattr("stockpredictor.news._call_openai_compatible_chat", fake_call)
+
+    feed = build_news_feed(["GOOD", "BAD"], settings, limit=10)
+
+    providers = {summary["symbol"]: summary["analysis_provider"] for summary in feed["summaries"]}
+    assert providers == {"GOOD": "localdeploy", "BAD": "llm_error"}
 
 
 def test_news_feed_can_attach_article_excerpts(tmp_path: Path, monkeypatch) -> None:
@@ -158,7 +218,7 @@ def test_news_feed_can_attach_article_excerpts(tmp_path: Path, monkeypatch) -> N
 
     monkeypatch.setattr(
         "stockpredictor.news.fetch_news_items",
-        lambda symbols, limit=50: [
+        lambda symbols, limit=50, **kwargs: [
             {
                 "symbol": "TEST",
                 "title": "TEST raises guidance",
@@ -204,7 +264,66 @@ def test_fetch_news_items_passes_limit_to_provider(monkeypatch) -> None:
         lambda symbol, limit=25: [{"symbol": symbol, "title": str(index)} for index in range(limit)],
     )
 
-    assert len(fetch_news_items(["TEST"], limit=8)) == 8
+    assert len(fetch_news_items(["TEST"], limit=8, sources=["yfinance_news"])) == 8
+
+
+def test_fetch_news_items_interleaves_configured_sources(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.context._yfinance_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yfinance_news", "title": f"yf-{index}"} for index in range(limit)],
+    )
+    monkeypatch.setattr(
+        "stockpredictor.context._yahoo_search_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yahoo_search_news", "title": f"ys-{index}"} for index in range(limit)],
+    )
+    monkeypatch.setattr(
+        "stockpredictor.context._google_news_rss",
+        lambda symbol, limit=25, source_config=None: [{"symbol": symbol, "source": "google_news_rss", "title": f"gn-{index}"} for index in range(limit)],
+    )
+
+    items = fetch_news_items(["TEST"], limit=6, sources=["yfinance_news", "yahoo_search_news", "google_news_rss"])
+
+    assert [item["source"] for item in items] == [
+        "yfinance_news",
+        "yahoo_search_news",
+        "google_news_rss",
+        "yfinance_news",
+        "yahoo_search_news",
+        "google_news_rss",
+    ]
+
+
+def test_fetch_news_items_distributes_limit_across_symbols(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.context._yfinance_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yfinance_news", "title": f"{symbol}-yf-{index}"} for index in range(limit)],
+    )
+    monkeypatch.setattr(
+        "stockpredictor.context._yahoo_search_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yahoo_search_news", "title": f"{symbol}-ys-{index}"} for index in range(limit)],
+    )
+    monkeypatch.setattr(
+        "stockpredictor.context._google_news_rss",
+        lambda symbol, limit=25, source_config=None: [{"symbol": symbol, "source": "google_news_rss", "title": f"{symbol}-gn-{index}"} for index in range(limit)],
+    )
+
+    items = fetch_news_items(["AAA", "BBB"], limit=6, sources=["yfinance_news", "yahoo_search_news", "google_news_rss"])
+
+    assert [item["symbol"] for item in items] == ["AAA", "AAA", "AAA", "BBB", "BBB", "BBB"]
+
+
+def test_normalize_llm_summary_handles_non_list_flags() -> None:
+    summary = _normalize_llm_summary(
+        {
+            "grand_summary": "ok",
+            "day_trader_focus": {"catalyst": "contract", "risk": "none", "tradeability": "confirm", "no_trade_flags": False},
+            "notes": False,
+        },
+        "localdeploy",
+    )
+
+    assert summary["day_trader_focus"]["no_trade_flags"] == []
+    assert summary["llm_notes"] == []
 
 
 def test_strip_json_fence_handles_single_line_fence() -> None:

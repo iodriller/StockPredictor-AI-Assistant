@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 import pandas as pd
 
@@ -19,6 +20,7 @@ from .snapshots import load_snapshots, record_snapshot
 
 
 LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[float, str], None]
 
 
 def analyze_symbol(
@@ -118,15 +120,20 @@ def scan_symbols(
     provider: MarketDataProvider | None = None,
     max_symbols: int | None = None,
     horizon: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[AnalysisResult]:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
     symbols = symbols or settings.watchlist()
     selected_symbols = symbols[:max_symbols] if max_symbols is not None else symbols
-    results = [
-        analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon)
-        for symbol in selected_symbols
-    ]
+    results = []
+    total = max(len(selected_symbols), 1)
+    for index, symbol in enumerate(selected_symbols, start=1):
+        if progress_callback is not None:
+            progress_callback((index - 1) / total, f"Analyzing {symbol} ({index}/{total})")
+        results.append(analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon))
+    if progress_callback is not None:
+        progress_callback(1.0, f"Scanner finished for {len(results)} symbol(s)")
     action_rank = {"long": 0, "short": 0, "watch": 1, "low_confidence": 2, "no_trade": 3}
     return sorted(
         results,

@@ -4,6 +4,7 @@ from html import unescape
 from html.parser import HTMLParser
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -37,11 +38,14 @@ CATEGORY_KEYWORDS = {
 
 def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50, progress_callback: ProgressCallback | None = None) -> dict[str, Any]:
     cfg = settings.context_agent.get("news_analysis", {})
-    max_per_symbol = int(cfg.get("max_headlines_per_symbol", 8))
+    requested_limit = max(1, int(limit))
+    max_per_symbol = int(cfg.get("max_headlines_per_symbol", 50))
     clean_symbols = clean_symbol_list(symbols)
+    summary_limit = min(max_per_symbol, max(1, math.ceil(requested_limit / max(len(clean_symbols), 1))))
+    headline_sources = _configured_headline_sources(settings)
     _notify_progress(progress_callback, 0.05, f"Preparing news request for {len(clean_symbols)} symbol(s)")
-    _notify_progress(progress_callback, 0.15, "Fetching configured headline sources")
-    all_items = fetch_news_items(clean_symbols, limit=max(limit, len(clean_symbols) * max_per_symbol))
+    _notify_progress(progress_callback, 0.15, f"Fetching configured headline sources: {', '.join(headline_sources)}")
+    all_items = fetch_news_items(clean_symbols, limit=max(requested_limit, len(clean_symbols) * summary_limit), sources=headline_sources, source_config=cfg)
     _notify_progress(progress_callback, 0.40, f"Fetched {len(all_items)} headline item(s)")
     enriched = [_enrich_item(item) for item in all_items]
     _notify_progress(progress_callback, 0.55, "Classified headline sentiment, category, impact, and freshness")
@@ -65,20 +69,29 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50, pro
     total_symbols = max(len(grouped), 1)
     for index, (symbol, items) in enumerate(grouped.items(), start=1):
         _notify_progress(progress_callback, 0.78 + 0.15 * ((index - 1) / total_symbols), f"Summarizing {symbol}")
-        clipped = items[:max_per_symbol]
-        summaries.append(_summarize_symbol_news(symbol, clipped, settings))
+        clipped = items[:summary_limit]
+        try:
+            summaries.append(_summarize_symbol_news(symbol, clipped, settings))
+        except NewsAnalysisError as exc:
+            if len(grouped) <= 1:
+                raise
+            summaries.append(_llm_error_symbol_summary(symbol, clipped, str(exc)))
+    headlines = enriched[:requested_limit]
     _notify_progress(progress_callback, 0.95, "Finalizing news feed")
     return {
         "symbols": clean_symbols,
         "headline_count": len(enriched),
-        "source_count": len([item for item in enriched if item.get("url")]),
+        "requested_headline_limit": requested_limit,
+        "returned_headline_count": len(headlines),
+        "summary_headline_limit_per_symbol": summary_limit,
+        "source_count": len([item for item in headlines if item.get("url")]),
         "fresh_catalyst_count": fresh_catalyst_count,
         "fresh_window_minutes": fresh_threshold,
-        "article_excerpt_count": sum(1 for item in enriched if item.get("article_excerpt")),
+        "article_excerpt_count": sum(1 for item in headlines if item.get("article_excerpt")),
         "summaries": summaries,
-        "headlines": enriched[:limit],
+        "headlines": headlines,
         "analysis_provider": _actual_analysis_provider(summaries),
-        "coverage": _coverage_metadata(settings, enriched),
+        "coverage": _coverage_metadata(settings, enriched, headline_sources),
     }
 
 
@@ -136,6 +149,29 @@ def _heuristic_symbol_summary(symbol: str, items: list[dict[str, Any]]) -> dict[
         },
         "sources": items,
         "analysis_provider": "heuristic",
+    }
+
+
+def _llm_error_symbol_summary(symbol: str, items: list[dict[str, Any]], error: str) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "grand_summary": f"LLM summary failed for {symbol}. The source links are still listed below for manual review.",
+        "source_count": len([item for item in items if item.get("url")]),
+        "headline_count": len(items),
+        "bullish_count": sum(1 for item in items if item.get("sentiment") == "bullish"),
+        "bearish_count": sum(1 for item in items if item.get("sentiment") == "bearish"),
+        "neutral_count": sum(1 for item in items if item.get("sentiment") == "neutral"),
+        "dominant_category": "llm_error",
+        "categories": _category_counts(items),
+        "day_trader_focus": {
+            "catalyst": "LLM summary unavailable.",
+            "risk": "Review linked sources manually before using this symbol.",
+            "tradeability": "Not scored by the LLM for this run.",
+            "no_trade_flags": ["LLM summary failed"],
+        },
+        "sources": items,
+        "analysis_provider": "llm_error",
+        "llm_error": error,
     }
 
 
@@ -234,6 +270,8 @@ def _normalize_llm_summary(parsed: dict[str, Any], provider: str) -> dict[str, A
     no_trade_flags = focus.get("no_trade_flags", [])
     if isinstance(no_trade_flags, str):
         no_trade_flags = [no_trade_flags]
+    elif not isinstance(no_trade_flags, list):
+        no_trade_flags = []
     focus = {
         "catalyst": str(focus.get("catalyst", "No clear catalyst identified.")),
         "risk": str(focus.get("risk", "No clear headline risk identified.")),
@@ -243,6 +281,8 @@ def _normalize_llm_summary(parsed: dict[str, Any], provider: str) -> dict[str, A
     notes = parsed.get("notes", [])
     if isinstance(notes, str):
         notes = [notes]
+    elif not isinstance(notes, list):
+        notes = []
     return {
         "grand_summary": str(parsed.get("grand_summary", "")),
         "dominant_category": str(parsed.get("dominant_category", "other")),
@@ -464,16 +504,33 @@ def _actual_analysis_provider(summaries: list[dict[str, Any]]) -> str:
     return ", ".join(providers) if providers else "heuristic"
 
 
-def _coverage_metadata(settings: Settings, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _configured_headline_sources(settings: Settings) -> list[str]:
+    configured = [str(source).lower() for source in settings.context_agent.get("sources", [])]
+    headline_sources = [source for source in configured if source in {"yfinance_news", "yahoo_search_news", "google_news_rss"}]
+    return headline_sources or ["yfinance_news"]
+
+
+def _coverage_metadata(settings: Settings, items: list[dict[str, Any]] | None = None, headline_sources: list[str] | None = None) -> dict[str, Any]:
     llm_cfg = settings.context_agent.get("news_analysis", {}).get("llm", {})
     news_cfg = settings.context_agent.get("news_analysis", {})
     scrape_cfg = news_cfg.get("article_scraping", {})
     configured_sources = [str(source) for source in settings.context_agent.get("sources", [])]
+    headline_sources = headline_sources or _configured_headline_sources(settings)
     items = items or []
     article_excerpt_count = sum(1 for item in items if item.get("article_excerpt"))
+    source_counts: dict[str, int] = {}
+    provider_counts: dict[str, int] = {}
+    for item in items:
+        source = str(item.get("source") or item.get("provider") or "unknown")
+        provider = str(item.get("provider") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
     return {
         "configured_sources": configured_sources,
-        "headline_provider": "yfinance_news" if "yfinance_news" in configured_sources else "configured/manual",
+        "headline_sources": headline_sources,
+        "headline_provider": ", ".join(headline_sources),
+        "source_counts": source_counts,
+        "provider_counts": provider_counts,
         "llm_enabled": bool(llm_cfg.get("enabled", False)),
         "llm_provider": str(llm_cfg.get("provider", "heuristic")),
         "fallback_to_heuristic": bool(llm_cfg.get("fallback_to_heuristic", True)),

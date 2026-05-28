@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import logging
+import xml.etree.ElementTree as ET
+import math
+
+import httpx
 
 from .config import Settings
 from .contracts import ContextSummary
@@ -12,6 +18,7 @@ from .utils import TTLCache, clamp, dedupe_preserve_order
 
 LOGGER = logging.getLogger(__name__)
 _NEWS_CACHE = TTLCache(ttl_seconds=120)
+DEFAULT_NEWS_SOURCES = ("yfinance_news", "yahoo_search_news", "google_news_rss")
 
 
 POSITIVE_WORDS = {"beat", "beats", "raise", "raises", "upgrade", "growth", "approval", "strong", "record", "deal", "guidance"}
@@ -37,8 +44,8 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     sources = [str(source) for source in cfg.get("sources", [])]
     if "manual" in sources:
         items.extend(cfg.get("manual_items", []))
-    if include_live_sources and "yfinance_news" in sources:
-        items.extend(fetch_news_items([symbol], limit=int(cfg.get("news_limit", 8))))
+    if include_live_sources and any(source in sources for source in DEFAULT_NEWS_SOURCES):
+        items.extend(fetch_news_items([symbol], limit=int(cfg.get("news_limit", 8)), sources=sources, source_config=cfg.get("news_analysis", {})))
 
     catalysts: list[str] = []
     risks: list[str] = []
@@ -115,11 +122,33 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     )
 
 
-def fetch_news_items(symbols: list[str], limit: int = 25) -> list[dict[str, Any]]:
+def fetch_news_items(
+    symbols: list[str],
+    limit: int = 25,
+    sources: list[str] | None = None,
+    source_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    active_sources = _active_news_sources(sources)
+    source_config = source_config or {}
+    per_symbol_limit = max(1, math.ceil(limit / max(len(symbols), 1)))
     items: list[dict[str, Any]] = []
     for symbol in symbols:
-        items.extend(_yfinance_news(symbol, limit=limit))
+        source_batches: list[list[dict[str, Any]]] = []
+        if "yfinance_news" in active_sources:
+            source_batches.append(_yfinance_news(symbol, limit=per_symbol_limit))
+        if "yahoo_search_news" in active_sources:
+            source_batches.append(_yahoo_search_news(symbol, limit=per_symbol_limit))
+        if "google_news_rss" in active_sources:
+            source_batches.append(_google_news_rss(symbol, limit=per_symbol_limit, source_config=source_config.get("google_news_rss", {})))
+        symbol_items = _interleave_news_batches(source_batches)
+        items.extend(_dedupe_news_items(symbol_items)[:per_symbol_limit])
     return items[:limit]
+
+
+def _active_news_sources(sources: list[str] | None) -> list[str]:
+    requested = [str(source).lower() for source in (sources or DEFAULT_NEWS_SOURCES)]
+    active = [source for source in requested if source in DEFAULT_NEWS_SOURCES]
+    return active or ["yfinance_news"]
 
 
 def _yfinance_news(symbol: str, limit: int = 25) -> list[dict[str, Any]]:
@@ -165,6 +194,136 @@ def _yfinance_news(symbol: str, limit: int = 25) -> list[dict[str, Any]]:
             )
     _NEWS_CACHE.set(cache_key, list(items))
     return items
+
+
+def _yahoo_search_news(symbol: str, limit: int = 25) -> list[dict[str, Any]]:
+    cache_key = ("yahoo_search_news", symbol.upper(), limit)
+    cached = _NEWS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    try:
+        response = httpx.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": symbol.upper(), "quotesCount": 0, "newsCount": limit},
+            headers={"User-Agent": "Mozilla/5.0 StockPredictor/0.1"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        news = response.json().get("news", [])
+    except Exception as exc:
+        LOGGER.warning("Yahoo search news fetch failed for %s: %s", symbol, exc)
+        return []
+
+    items = []
+    for entry in news[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+        published = entry.get("providerPublishTime", "")
+        if isinstance(published, (int, float)):
+            published = datetime.fromtimestamp(int(published), tz=timezone.utc).isoformat()
+        impact = _score_item(title, {})
+        items.append(
+            {
+                "symbol": symbol.upper(),
+                "source": "yahoo_search_news",
+                "provider": str(entry.get("publisher") or "Yahoo Finance Search"),
+                "title": title,
+                "url": str(entry.get("link") or ""),
+                "published": str(published),
+                "impact": impact,
+                "sentiment": "bullish" if impact > 0.15 else "bearish" if impact < -0.15 else "neutral",
+            }
+        )
+    _NEWS_CACHE.set(cache_key, list(items))
+    return items
+
+
+def _google_news_rss(symbol: str, limit: int = 25, source_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    source_config = source_config or {}
+    query_template = str(source_config.get("query_template", "{symbol} stock"))
+    query = query_template.format(symbol=symbol.upper())
+    params = {
+        "q": query,
+        "hl": str(source_config.get("hl", "en-US")),
+        "gl": str(source_config.get("gl", "US")),
+        "ceid": str(source_config.get("ceid", "US:en")),
+    }
+    cache_key = ("google_news_rss", symbol.upper(), limit, tuple(sorted(params.items())))
+    cached = _NEWS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    try:
+        response = httpx.get(
+            "https://news.google.com/rss/search",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0 StockPredictor/0.1"},
+            timeout=float(source_config.get("timeout_seconds", 10)),
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except Exception as exc:
+        LOGGER.warning("Google News RSS fetch failed for %s: %s", symbol, exc)
+        return []
+
+    items = []
+    for entry in root.findall("./channel/item")[:limit]:
+        title = (entry.findtext("title") or "").strip()
+        if not title:
+            continue
+        provider = (entry.findtext("source") or "").strip()
+        published = _rss_date_to_iso(entry.findtext("pubDate"))
+        impact = _score_item(title, {})
+        items.append(
+            {
+                "symbol": symbol.upper(),
+                "source": "google_news_rss",
+                "provider": provider or "Google News",
+                "title": title,
+                "url": str(entry.findtext("link") or ""),
+                "published": published,
+                "impact": impact,
+                "sentiment": "bullish" if impact > 0.15 else "bearish" if impact < -0.15 else "neutral",
+            }
+        )
+    _NEWS_CACHE.set(cache_key, list(items))
+    return items
+
+
+def _rss_date_to_iso(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _dedupe_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for item in items:
+        key = (str(item.get("symbol") or ""), str(item.get("url") or item.get("title") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _interleave_news_batches(batches: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    max_len = max((len(batch) for batch in batches), default=0)
+    for index in range(max_len):
+        for batch in batches:
+            if index < len(batch):
+                merged.append(batch[index])
+    return merged
 
 
 def _score_item(title: str, item: dict[str, Any]) -> float:
