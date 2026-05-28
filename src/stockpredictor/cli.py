@@ -27,9 +27,11 @@ def main(argv: list[str] | None = None) -> int:
 
     analyze_parser = subparsers.add_parser("analyze", parents=[common], help="Analyze one symbol.")
     analyze_parser.add_argument("symbol")
+    analyze_parser.add_argument("--horizon", default=None, help="Override the analysis horizon (intraday/swing/position).")
 
     scan_parser = subparsers.add_parser("scan", parents=[common], help="Scan a watchlist or symbols.")
     scan_parser.add_argument("symbols", nargs="*")
+    scan_parser.add_argument("--horizon", default=None, help="Override the analysis horizon for every scanned symbol.")
 
     backtest_parser = subparsers.add_parser("backtest", parents=[common], help="Run the configured backtest.")
     backtest_parser.add_argument("symbols", nargs="*")
@@ -66,9 +68,9 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings(args.config)
     if args.command == "analyze":
-        _print_json(analyze_symbol(args.symbol, settings))
+        _print_json(analyze_symbol(args.symbol, settings, horizon=getattr(args, "horizon", None)))
     elif args.command == "scan":
-        _print_json(scan_symbols(settings, symbols=args.symbols or None))
+        _print_json(scan_symbols(settings, symbols=args.symbols or None, horizon=getattr(args, "horizon", None)))
     elif args.command == "backtest":
         _print_json(run_backtest(settings, symbols=args.symbols or None))
     return 0

@@ -80,6 +80,21 @@ class Settings:
     def enabled_models(self) -> list[str]:
         return [str(model_name) for model_name in self.models.get("enabled", [])]
 
+    @property
+    def horizons(self) -> dict[str, Any]:
+        return self.raw.get("horizons", {})
+
+    def horizon_profile(self, horizon: str | None = None) -> dict[str, Any]:
+        """Return the configured horizon profile, with safe fallbacks if the section is absent."""
+        profiles = self.horizons.get("profiles", {})
+        default_name = str(self.horizons.get("default", "swing"))
+        name = (horizon or default_name).lower()
+        profile = profiles.get(name) or profiles.get(default_name) or {}
+        # Always carry the resolved name back to the caller so logging/UIs can show it.
+        profile = dict(profile)
+        profile.setdefault("name", name)
+        return profile
+
 
 def load_settings(config_path: str | os.PathLike[str] | None = None) -> Settings:
     path = Path(config_path or os.environ.get("STOCKPREDICTOR_CONFIG") or DEFAULT_CONFIG_PATH)

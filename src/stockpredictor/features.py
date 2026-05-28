@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .config import Settings
-from .contracts import FeatureSet
+from .contracts import FeatureSet, SessionContext
 from .utils import clamp, to_float
 
 
@@ -231,6 +231,106 @@ def _trend_label(latest_close: float, indicators: dict[str, float | str | None])
     if latest_close < sma_9 < sma_20 and (not sma_50 or sma_20 < sma_50):
         return "downtrend"
     return "mixed"
+
+
+def build_intraday_features(
+    symbol: str,
+    intraday_frame: pd.DataFrame,
+    session: SessionContext | None,
+    settings: Settings,
+) -> dict[str, float | str | None]:
+    """Compute a small set of intraday indicators on minute/5-minute bars.
+
+    Returns a flat dict that lives next to (but separate from) the daily indicators.
+    Anchored values prefer the SessionContext, which is already today-only.
+    """
+    if intraday_frame is None or intraday_frame.empty:
+        return {}
+    features: dict[str, float | str | None] = {"intraday_bars": float(len(intraday_frame))}
+    close = intraday_frame["Close"]
+    high = intraday_frame["High"]
+    low = intraday_frame["Low"]
+    rsi_window = int(settings.features.get("intraday_rsi_window", 14))
+    if len(close) >= rsi_window + 1:
+        features["intraday_rsi"] = to_float(_rsi(close, period=rsi_window).iloc[-1], None)
+    if len(close) >= 26:
+        macd_line, _, macd_hist = _macd(close)
+        features["intraday_macd"] = to_float(macd_line.iloc[-1], None)
+        features["intraday_macd_hist"] = to_float(macd_hist.iloc[-1], None)
+    atr_window = int(settings.features.get("intraday_atr_window", 14))
+    if len(close) >= atr_window + 1:
+        atr_series = _atr(high, low, close, period=atr_window)
+        features["intraday_atr"] = to_float(atr_series.iloc[-1], None)
+        last_close = float(close.iloc[-1])
+        features["intraday_atr_pct"] = to_float(atr_series.iloc[-1] / last_close if last_close else None, None)
+    # Last 5 / 20 bar momentum gives the dashboard a "what just happened" view.
+    if len(close) >= 6:
+        features["intraday_return_5bar"] = to_float((close.iloc[-1] / close.iloc[-6]) - 1, None)
+    if len(close) >= 21:
+        features["intraday_return_20bar"] = to_float((close.iloc[-1] / close.iloc[-21]) - 1, None)
+    if session is not None:
+        if session.live_price is not None and session.session_vwap:
+            features["intraday_vwap_distance_pct"] = (session.live_price / session.session_vwap) - 1
+        if session.live_price is not None and session.session_open:
+            features["intraday_open_distance_pct"] = (session.live_price / session.session_open) - 1
+        if session.time_of_day_rvol is not None:
+            features["intraday_rvol_tod"] = session.time_of_day_rvol
+        if session.opening_range_high is not None and session.opening_range_low is not None and session.live_price is not None:
+            if session.live_price > session.opening_range_high:
+                features["opening_range_break"] = "above"
+            elif session.live_price < session.opening_range_low:
+                features["opening_range_break"] = "below"
+            else:
+                features["opening_range_break"] = "inside"
+        if session.premarket_high is not None and session.live_price is not None:
+            features["above_premarket_high"] = bool(session.live_price > session.premarket_high)
+        if session.premarket_low is not None and session.live_price is not None:
+            features["below_premarket_low"] = bool(session.live_price < session.premarket_low)
+    return features
+
+
+def intraday_technical_score(features: dict[str, float | str | None]) -> tuple[float, list[str]]:
+    """Translate intraday features into a directional score in [-1, 1] with human-readable reasons."""
+    score = 0.0
+    reasons: list[str] = []
+    if not features:
+        return 0.0, []
+    vwap_distance = to_float(features.get("intraday_vwap_distance_pct"), 0.0)
+    if vwap_distance > 0.0015:
+        score += 0.18
+        reasons.append("price is holding above today's VWAP")
+    elif vwap_distance < -0.0015:
+        score -= 0.18
+        reasons.append("price is below today's VWAP")
+    rsi = to_float(features.get("intraday_rsi"), 50.0)
+    if rsi >= 70:
+        score -= 0.10
+        reasons.append("intraday RSI is extended")
+    elif rsi <= 30:
+        score += 0.10
+        reasons.append("intraday RSI is oversold")
+    macd_hist = to_float(features.get("intraday_macd_hist"), 0.0)
+    if macd_hist > 0:
+        score += 0.10
+        reasons.append("intraday MACD momentum is positive")
+    elif macd_hist < 0:
+        score -= 0.10
+        reasons.append("intraday MACD momentum is negative")
+    rvol = to_float(features.get("intraday_rvol_tod"), 1.0)
+    if rvol >= 1.5:
+        # Volume confirms direction rather than driving it.
+        score += 0.06 if score >= 0 else -0.06
+        reasons.append("intraday volume is above the typical pace for this time of day")
+    elif rvol < 0.7:
+        reasons.append("intraday volume is below typical pace — confirmation is weak")
+    orb = str(features.get("opening_range_break", ""))
+    if orb == "above":
+        score += 0.12
+        reasons.append("price broke above the opening range")
+    elif orb == "below":
+        score -= 0.12
+        reasons.append("price broke below the opening range")
+    return clamp(score, -1.0, 1.0), reasons
 
 
 def _market_regime(indicators: dict[str, float | str | None]) -> str:

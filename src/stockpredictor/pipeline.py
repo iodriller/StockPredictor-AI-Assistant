@@ -4,14 +4,18 @@ import logging
 
 import pandas as pd
 
+from .calendar import build_calendar_context
 from .config import Settings, load_settings
 from .context import build_context_summary
 from .contracts import AnalysisResult
-from .data import MarketDataProvider, build_snapshot, fetch_market_data, get_market_data_provider
-from .features import build_feature_set
+from .data import MarketDataProvider, build_snapshot, fetch_intraday_data, fetch_market_data, get_market_data_provider
+from .features import build_feature_set, build_intraday_features, intraday_technical_score
+from .market import build_market_state, build_sector_context
 from .models import run_models
 from .risk import apply_risk_controls
+from .session import build_session_context
 from .signals import fuse_signals
+from .snapshots import load_snapshots, record_snapshot
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,21 +28,70 @@ def analyze_symbol(
     model_names: list[str] | None = None,
     data_frame: pd.DataFrame | None = None,
     include_context: bool = True,
+    horizon: str | None = None,
+    include_market_context: bool = True,
+    include_session: bool = True,
+    include_snapshot: bool = True,
 ) -> AnalysisResult:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
     symbol = symbol.upper()
+    horizon_name = (horizon or str(settings.horizons.get("default", "swing"))).lower()
     frame = data_frame.copy() if data_frame is not None else fetch_market_data(symbol, settings, provider)
     snapshot = build_snapshot(symbol, frame, settings, getattr(provider, "name", "configured"))
     features = build_feature_set(symbol, frame, settings)
     if data_frame is None:
         _add_benchmark_features(symbol, frame, features, settings, provider)
-    predictions = run_models(symbol, frame, settings, model_names=model_names)
+
+    # Intraday session + multi-timeframe features (only meaningful in a live request,
+    # not in the backtest, where data_frame is supplied historically).
+    session = None
+    intraday_features: dict = {}
+    intraday_score = 0.0
+    intraday_reasons: list[str] = []
+    if include_session and data_frame is None:
+        intraday_frame = fetch_intraday_data(symbol, settings, provider)
+        session = build_session_context(symbol, intraday_frame, settings)
+        if intraday_frame is not None:
+            intraday_features = build_intraday_features(symbol, intraday_frame, session, settings)
+            intraday_score, intraday_reasons = intraday_technical_score(intraday_features)
+
+    # Broad-market and sector cross-check (skipped in backtest).
+    market_state = None
+    sector_context = None
+    calendar_context = None
+    if include_market_context and data_frame is None:
+        market_state = build_market_state(settings, provider)
+        sector_context = build_sector_context(symbol, settings, provider)
+        calendar_context = build_calendar_context(symbol, settings)
+
+    predictions = run_models(symbol, frame, settings, model_names=model_names, horizon=horizon_name)
     context = build_context_summary(symbol, settings, include_live_sources=include_context)
-    decision = fuse_signals(symbol, features, predictions, context, settings)
-    decision, risk_plan = apply_risk_controls(decision, features, frame, settings)
+    decision = fuse_signals(
+        symbol,
+        features,
+        predictions,
+        context,
+        settings,
+        horizon=horizon_name,
+        intraday_score=intraday_score,
+        intraday_reasons=intraday_reasons,
+        market_state=market_state,
+        sector_context=sector_context,
+        calendar_context=calendar_context,
+    )
+    decision, risk_plan = apply_risk_controls(
+        decision,
+        features,
+        frame,
+        settings,
+        session=session,
+        horizon=horizon_name,
+        intraday_features=intraday_features,
+    )
     scanner_row = build_scanner_row(snapshot, features, context, decision, risk_plan)
-    return AnalysisResult(
+    previous = load_snapshots(settings, symbol, limit=int(settings.raw.get("snapshots", {}).get("compare_window", 5)))
+    result = AnalysisResult(
         snapshot=snapshot,
         features=features,
         predictions=predictions,
@@ -46,7 +99,17 @@ def analyze_symbol(
         decision=decision,
         risk_plan=risk_plan,
         scanner_row=scanner_row,
+        horizon=horizon_name,
+        session=session,
+        intraday_features=intraday_features,
+        market_state=market_state,
+        sector_context=sector_context,
+        calendar=calendar_context,
+        previous_snapshots=previous,
     )
+    if include_snapshot and data_frame is None:
+        result.snapshot_record = record_snapshot(settings, result, horizon=horizon_name)
+    return result
 
 
 def scan_symbols(
@@ -54,13 +117,14 @@ def scan_symbols(
     symbols: list[str] | None = None,
     provider: MarketDataProvider | None = None,
     max_symbols: int | None = None,
+    horizon: str | None = None,
 ) -> list[AnalysisResult]:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
     symbols = symbols or settings.watchlist()
     selected_symbols = symbols[:max_symbols] if max_symbols is not None else symbols
     results = [
-        analyze_symbol(symbol, settings=settings, provider=provider)
+        analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon)
         for symbol in selected_symbols
     ]
     action_rank = {"long": 0, "short": 0, "watch": 1, "low_confidence": 2, "no_trade": 3}

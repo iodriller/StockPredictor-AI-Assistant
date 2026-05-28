@@ -71,6 +71,17 @@ The local API includes:
 - `POST /journal`
 - `PATCH /journal/{entry_id}`
 - `DELETE /journal/{entry_id}`
+- `GET /snapshots/{symbol}` — recent persisted analysis snapshots for delta comparison.
+
+`/analyze/{symbol}` and `/scan` accept a `horizon` parameter (`intraday`, `swing`,
+or `position`) that flexes ATR multiples, model lookback, target R, and signal
+weights. Each analyze call also returns:
+
+- `session` — today's intraday context (live price, session VWAP, premarket high/low, opening range, time-of-day RVOL).
+- `market_state` — SPY / QQQ / IWM / VIX state.
+- `sector_context` — sector ETF for the symbol and its alignment with the symbol's move.
+- `calendar` — current market session, next earnings, configured macro events, and resulting no-trade flags.
+- `snapshot_record` and `previous_snapshots` — current analysis persisted to JSONL with the prior N records loaded so the dashboard can show "what changed since I last looked."
 
 The GET scan/analyze routes are read-only. The POST routes are kept for
 compatibility and store latest results under a caller-supplied `session_id`

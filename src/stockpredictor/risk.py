@@ -5,7 +5,7 @@ from dataclasses import replace
 import pandas as pd
 
 from .config import Settings
-from .contracts import FeatureSet, RiskPlan, SignalDecision
+from .contracts import FeatureSet, RiskPlan, SessionContext, SignalDecision
 from .utils import to_float
 
 
@@ -14,17 +14,51 @@ def apply_risk_controls(
     features: FeatureSet,
     frame: pd.DataFrame,
     settings: Settings,
+    session: SessionContext | None = None,
+    horizon: str | None = None,
+    intraday_features: dict | None = None,
 ) -> tuple[SignalDecision, RiskPlan]:
     risk_cfg = settings.risk
-    latest_price = to_float(frame["Close"].iloc[-1])
-    atr = to_float(features.indicators.get("atr"), latest_price * 0.02)
-    atr_pct = to_float(features.indicators.get("atr_pct"), atr / latest_price if latest_price else 0.0)
+    horizon_profile = settings.horizon_profile(horizon)
+    horizon_name = str(horizon_profile.get("name", "swing"))
+
+    # Anchor the plan on the live intraday price when available — this is the core
+    # decision-tool fix: stop pricing trades against yesterday's close.
+    live_price = session.live_price if session is not None else None
+    latest_price = to_float(live_price if live_price is not None else frame["Close"].iloc[-1])
+
+    # ATR source depends on horizon: intraday uses minute-bar ATR if we have it.
+    intraday_atr = None
+    intraday_atr_pct = None
+    if intraday_features:
+        intraday_atr = intraday_features.get("intraday_atr")
+        intraday_atr_pct = intraday_features.get("intraday_atr_pct")
+    if horizon_name == "intraday" and intraday_atr:
+        atr = to_float(intraday_atr, latest_price * 0.005)
+        atr_pct = to_float(intraday_atr_pct, atr / latest_price if latest_price else 0.0)
+    else:
+        atr = to_float(features.indicators.get("atr"), latest_price * 0.02)
+        atr_pct = to_float(features.indicators.get("atr_pct"), atr / latest_price if latest_price else 0.0)
+
     volume_window = int(settings.features.get("volume_window", 20))
     avg_volume = to_float(features.indicators.get("avg_volume"), frame["Volume"].tail(volume_window).mean())
-    vwap = to_float(features.indicators.get("vwap"), 0.0)
-    support = to_float(features.indicators.get("support"), 0.0)
-    resistance = to_float(features.indicators.get("resistance"), 0.0)
-    notes: list[str] = []
+
+    # Prefer the session-anchored VWAP/support/resistance when we have today's data.
+    daily_vwap = to_float(features.indicators.get("vwap"), 0.0)
+    daily_support = to_float(features.indicators.get("support"), 0.0)
+    daily_resistance = to_float(features.indicators.get("resistance"), 0.0)
+    if session is not None and horizon_name == "intraday":
+        vwap = to_float(session.session_vwap, daily_vwap)
+        support = to_float(session.session_low or session.opening_range_low or daily_support, daily_support)
+        resistance = to_float(session.session_high or session.opening_range_high or daily_resistance, daily_resistance)
+    else:
+        vwap = daily_vwap
+        support = daily_support
+        resistance = daily_resistance
+
+    notes: list[str] = [f"Horizon profile: {horizon_name}."]
+    if live_price is not None:
+        notes.append(f"Anchored on live price {live_price:.2f}.")
     session_checks = _session_checks(settings, avg_volume)
 
     if decision.action not in {"long", "short"}:
@@ -109,8 +143,11 @@ def apply_risk_controls(
         )
 
     entry = latest_price
-    entry_zone = _entry_zone(latest_price, atr, decision.action)
-    stop_distance = max(atr * float(risk_cfg.get("atr_stop_multiple", 1.5)), entry * 0.003)
+    atr_stop_multiple = float(horizon_profile.get("atr_stop_multiple", risk_cfg.get("atr_stop_multiple", 1.5)))
+    entry_cushion_atr = float(horizon_profile.get("entry_cushion_atr", 0.25))
+    entry_cushion_pct = float(horizon_profile.get("entry_cushion_pct", 0.002))
+    entry_zone = _entry_zone(latest_price, atr, decision.action, entry_cushion_atr, entry_cushion_pct)
+    stop_distance = max(atr * atr_stop_multiple, entry * 0.003)
     if decision.action == "long":
         fallback_stop = max(entry - stop_distance, entry * 0.01)
         structural_stop, stop_source = _best_long_stop(
@@ -119,7 +156,7 @@ def apply_risk_controls(
             fallback_stop,
         )
         stop_loss = min(entry - entry * 0.003, structural_stop - atr * 0.20)
-        raw_target = entry + abs(entry - stop_loss) * _primary_target_multiple(risk_cfg)
+        raw_target = entry + abs(entry - stop_loss) * _primary_target_multiple(risk_cfg, horizon_profile)
         targets, target_source = _merge_structural_target(raw_target, resistance, long=True)
         invalidation = "Long idea is invalid below stop loss, nearby support, or sustained loss of VWAP."
     else:
@@ -130,7 +167,7 @@ def apply_risk_controls(
             fallback_stop,
         )
         stop_loss = max(entry + entry * 0.003, structural_stop + atr * 0.20)
-        raw_target = entry - abs(entry - stop_loss) * _primary_target_multiple(risk_cfg)
+        raw_target = entry - abs(entry - stop_loss) * _primary_target_multiple(risk_cfg, horizon_profile)
         targets, target_source = _merge_structural_target(raw_target, support, long=False)
         invalidation = "Short idea is invalid above stop loss, nearby resistance, or sustained reclaim of VWAP."
 
@@ -218,10 +255,16 @@ def apply_risk_controls(
     )
 
 
-def _entry_zone(price: float, atr: float, action: str) -> tuple[float, float] | None:
+def _entry_zone(
+    price: float,
+    atr: float,
+    action: str,
+    atr_cushion: float = 0.25,
+    pct_cushion: float = 0.002,
+) -> tuple[float, float] | None:
     if action not in {"long", "short"} or price <= 0:
         return None
-    cushion = max(atr * 0.25, price * 0.002)
+    cushion = max(atr * atr_cushion, price * pct_cushion)
     if action == "long":
         return (price - cushion, price + cushion * 0.5)
     return (price - cushion * 0.5, price + cushion)
@@ -237,7 +280,9 @@ def _merge_structural_target(raw_target: float, structural_level: float, long: b
     return [raw_target], "r_multiple"
 
 
-def _primary_target_multiple(risk_cfg: dict) -> float:
+def _primary_target_multiple(risk_cfg: dict, horizon_profile: dict | None = None) -> float:
+    if horizon_profile and "target_r_multiple" in horizon_profile:
+        return float(horizon_profile["target_r_multiple"])
     if "target_r_multiple" in risk_cfg:
         return float(risk_cfg["target_r_multiple"])
     configured = risk_cfg.get("target_r_multiples", [1.5])

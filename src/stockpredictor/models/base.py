@@ -32,3 +32,11 @@ def direction_threshold(settings: Settings, horizon_days: int) -> float:
     per_day = float(models_cfg.get("direction_threshold_per_day_pct", 0.0005))
     return per_day * max(1, int(horizon_days))
 
+
+def horizon_model_params(settings: Settings, horizon: str | None) -> tuple[int, int]:
+    """Resolve (horizon_days, lookback_rows) for the requested analysis horizon."""
+    profile = settings.horizon_profile(horizon)
+    horizon_days = int(profile.get("horizon_days", settings.models.get("horizon_days", 5)))
+    lookback_rows = int(profile.get("lookback_rows", settings.models.get("lookback_rows", 180)))
+    return horizon_days, lookback_rows
+

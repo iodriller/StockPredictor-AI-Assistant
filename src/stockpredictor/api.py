@@ -18,6 +18,7 @@ from .journal import (
 )
 from .news import build_news_feed
 from .pipeline import analyze_symbol, scan_symbols
+from .snapshots import load_snapshots
 from .symbols import search_symbols
 from .utils import to_serializable
 
@@ -27,6 +28,7 @@ class ScanRequest(BaseModel):
     config_path: str | None = Field(default=None)
     session_id: str = Field(default="default")
     max_symbols: int | None = Field(default=None)
+    horizon: str | None = Field(default=None)
 
 
 class BacktestRequest(BaseModel):
@@ -37,6 +39,7 @@ class BacktestRequest(BaseModel):
 class AnalyzeRequest(BaseModel):
     config_path: str | None = Field(default=None)
     session_id: str = Field(default="default")
+    horizon: str | None = Field(default=None)
 
 
 class JournalRequest(BaseModel):
@@ -99,10 +102,17 @@ def create_app(config_path: str | None = None) -> FastAPI:
         return to_serializable(build_news_feed(requested_symbols, app.state.settings, limit=limit))
 
     @app.get("/scan")
-    def scan_get(symbols: str = "", config_path: str | None = None, max_symbols: int | None = None) -> list[dict[str, Any]]:
+    def scan_get(
+        symbols: str = "",
+        config_path: str | None = None,
+        max_symbols: int | None = None,
+        horizon: str | None = None,
+    ) -> list[dict[str, Any]]:
         active_settings = _settings_for_request(app, config_path)
         requested_symbols = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()] or None
-        return to_serializable(scan_symbols(active_settings, symbols=requested_symbols, max_symbols=max_symbols))
+        return to_serializable(
+            scan_symbols(active_settings, symbols=requested_symbols, max_symbols=max_symbols, horizon=horizon)
+        )
 
     @app.post("/scan")
     def scan(request: ScanRequest | None = Body(default=None)) -> list[dict[str, Any]]:
@@ -111,21 +121,27 @@ def create_app(config_path: str | None = None) -> FastAPI:
             active_settings,
             symbols=request.symbols if request else None,
             max_symbols=request.max_symbols if request else None,
+            horizon=request.horizon if request else None,
         )
         _set_latest_signals(app, request.session_id if request else "default", results)
         return to_serializable(results)
 
     @app.get("/analyze/{symbol}")
-    def analyze_get(symbol: str, config_path: str | None = None) -> dict[str, Any]:
+    def analyze_get(symbol: str, config_path: str | None = None, horizon: str | None = None) -> dict[str, Any]:
         active_settings = _settings_for_request(app, config_path)
-        return to_serializable(analyze_symbol(symbol, active_settings))
+        return to_serializable(analyze_symbol(symbol, active_settings, horizon=horizon))
 
     @app.post("/analyze/{symbol}")
     def analyze(symbol: str, request: AnalyzeRequest | None = Body(default=None)) -> dict[str, Any]:
         active_settings = _settings_for_request(app, request.config_path if request else None)
-        result = analyze_symbol(symbol, active_settings)
+        result = analyze_symbol(symbol, active_settings, horizon=request.horizon if request else None)
         _set_latest_signals(app, request.session_id if request else "default", [result])
         return to_serializable(result)
+
+    @app.get("/snapshots/{symbol}")
+    def snapshots_for_symbol(symbol: str, limit: int = 25, config_path: str | None = None) -> list[dict[str, Any]]:
+        active_settings = _settings_for_request(app, config_path)
+        return to_serializable(load_snapshots(active_settings, symbol, limit=limit))
 
     @app.post("/backtest")
     def backtest(request: BacktestRequest | None = Body(default=None)) -> dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -29,6 +30,20 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50) -> 
     clean_symbols = clean_symbol_list(symbols)
     all_items = fetch_news_items(clean_symbols, limit=max(limit, len(clean_symbols) * max_per_symbol))
     enriched = [_enrich_item(item) for item in all_items]
+    # Prioritize fresh, relevant items so the dashboard's top row is the most
+    # actionable headline, not just the first one the provider returned.
+    enriched.sort(
+        key=lambda item: (
+            float(item.get("freshness", 0.0)) * float(item.get("day_trader_relevance", 0.0)),
+            float(item.get("freshness", 0.0)),
+            abs(float(item.get("impact", 0.0))),
+        ),
+        reverse=True,
+    )
+    fresh_threshold = float(cfg.get("fresh_window_minutes", 60))
+    fresh_catalyst_count = sum(
+        1 for item in enriched if (item.get("age_minutes") is not None and float(item["age_minutes"]) <= fresh_threshold and abs(float(item.get("impact", 0.0))) >= 0.15)
+    )
     grouped = {symbol: [item for item in enriched if item.get("symbol") == symbol] for symbol in clean_symbols}
     summaries = []
     for symbol, items in grouped.items():
@@ -38,6 +53,8 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50) -> 
         "symbols": clean_symbols,
         "headline_count": len(enriched),
         "source_count": len([item for item in enriched if item.get("url")]),
+        "fresh_catalyst_count": fresh_catalyst_count,
+        "fresh_window_minutes": fresh_threshold,
         "summaries": summaries,
         "headlines": enriched[:limit],
         "analysis_provider": _analysis_provider(settings),
@@ -209,12 +226,16 @@ def _enrich_item(item: dict[str, Any]) -> dict[str, Any]:
     title = str(item.get("title", ""))
     category = _classify_category(title)
     impact = clamp(float(item.get("impact", 0.0) or 0.0), -1.0, 1.0)
+    age_minutes = _published_age_minutes(item.get("published"))
+    freshness = _freshness_score(age_minutes)
     return {
         **item,
         "symbol": str(item.get("symbol", "")).upper(),
         "category": category,
         "impact": impact,
-        "day_trader_relevance": _relevance_score(title, impact, category),
+        "age_minutes": age_minutes,
+        "freshness": freshness,
+        "day_trader_relevance": _relevance_score(title, impact, category, freshness),
     }
 
 
@@ -226,10 +247,52 @@ def _classify_category(title: str) -> str:
     return "other"
 
 
-def _relevance_score(title: str, impact: float, category: str) -> float:
+def _relevance_score(title: str, impact: float, category: str, freshness: float = 0.0) -> float:
     category_boost = 0.25 if category in {"earnings_guidance", "analyst_action", "sec_filing", "macro", "legal_regulatory", "m_and_a"} else 0.05
     title_boost = min(len(title.split()) / 80, 0.15)
-    return clamp(abs(impact) + category_boost + title_boost, 0.0, 1.0)
+    # Freshness compounds the relevance of high-impact items: a 60-minute-old
+    # earnings beat matters more than a 12-hour-old one.
+    freshness_boost = freshness * 0.20
+    return clamp(abs(impact) + category_boost + title_boost + freshness_boost, 0.0, 1.0)
+
+
+def _published_age_minutes(published: object) -> float | None:
+    if published is None:
+        return None
+    raw = str(published)
+    if not raw:
+        return None
+    parsed: datetime | None = None
+    # yfinance sometimes returns epoch seconds, sometimes ISO strings.
+    if raw.isdigit():
+        try:
+            parsed = datetime.fromtimestamp(int(raw), tz=timezone.utc)
+        except (OverflowError, ValueError):
+            parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - parsed).total_seconds() / 60
+    return max(0.0, age)
+
+
+def _freshness_score(age_minutes: float | None) -> float:
+    """Decay-based score: 1.0 right now, 0.5 at ~3h, ~0.1 by ~24h."""
+    if age_minutes is None:
+        return 0.0
+    if age_minutes <= 5:
+        return 1.0
+    if age_minutes <= 180:
+        return clamp(1.0 - (age_minutes - 5) / 350, 0.5, 1.0)
+    if age_minutes <= 24 * 60:
+        return clamp(0.5 - (age_minutes - 180) / 2880, 0.1, 0.5)
+    return 0.0
 
 
 def _category_counts(items: list[dict[str, Any]]) -> dict[str, int]:

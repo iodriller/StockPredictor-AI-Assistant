@@ -2,6 +2,7 @@ app:
   name: StockPredictor Trading Intelligence
   environment: local
   timezone: America/Chicago
+  market_timezone: America/New_York
 
 data:
   provider: yfinance
@@ -12,6 +13,12 @@ data:
   allow_synthetic_fallback: true
   synthetic_seed: 7
   cache_ttl_seconds: 300
+  intraday:
+    enabled: true
+    interval: 1m
+    period: 5d            # last 5 trading days of minute bars — enables time-of-day RVOL
+    include_premarket: true
+    cache_ttl_seconds: 60
 
 watchlists:
   default:
@@ -155,3 +162,65 @@ dashboard:
   default_symbol: AAPL
   default_watchlist: default
   max_scan_symbols: 10
+
+horizons:
+  default: swing
+  profiles:
+    intraday:
+      horizon_days: 1
+      lookback_rows: 30
+      atr_stop_multiple: 0.8
+      target_r_multiple: 1.5
+      entry_cushion_atr: 0.15
+      entry_cushion_pct: 0.0015
+      weights:
+        models: 0.15
+        technicals: 0.20
+        intraday: 0.45
+        context: 0.15
+        sentiment: 0.05
+    swing:
+      horizon_days: 5
+      lookback_rows: 180
+      atr_stop_multiple: 1.5
+      target_r_multiple: 1.5
+      entry_cushion_atr: 0.25
+      entry_cushion_pct: 0.002
+      weights:
+        models: 0.35
+        technicals: 0.30
+        intraday: 0.10
+        context: 0.20
+        sentiment: 0.05
+    position:
+      horizon_days: 20
+      lookback_rows: 252
+      atr_stop_multiple: 2.5
+      target_r_multiple: 2.5
+      entry_cushion_atr: 0.40
+      entry_cushion_pct: 0.004
+      weights:
+        models: 0.45
+        technicals: 0.30
+        intraday: 0.0
+        context: 0.20
+        sentiment: 0.05
+
+market_context:
+  enabled: true
+  sector_enabled: true
+  market_symbols:
+    spy: SPY
+    qqq: QQQ
+    iwm: IWM
+    vix: ^VIX
+  sector_etf_overrides: {}
+
+calendar:
+  earnings_enabled: true
+  macro_events: []   # e.g. [{date: "2026-06-12", time: "08:30", label: "CPI", impact: "high"}]
+
+snapshots:
+  enabled: true
+  path: data/analysis_snapshots.local.jsonl
+  compare_window: 5

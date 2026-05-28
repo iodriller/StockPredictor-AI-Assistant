@@ -15,6 +15,7 @@ from .utils import TTLCache, to_float
 
 LOGGER = logging.getLogger(__name__)
 _MARKET_DATA_CACHE = TTLCache(ttl_seconds=300)
+_INTRADAY_CACHE = TTLCache(ttl_seconds=60)
 
 
 class MarketDataProvider(Protocol):
@@ -41,11 +42,47 @@ class YFinanceProvider:
         )
         return normalize_ohlcv(frame, symbol)
 
+    def fetch_intraday(self, symbol: str, period: str, interval: str, prepost: bool = True) -> pd.DataFrame:
+        import yfinance as yf
+
+        frame = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            prepost=prepost,
+            progress=False,
+            threads=False,
+        )
+        return normalize_ohlcv(frame, symbol)
+
 
 @dataclass
 class SyntheticProvider:
     seed: int = 7
     name: str = "synthetic"
+
+    def fetch_intraday(self, symbol: str, period: str, interval: str, prepost: bool = True) -> pd.DataFrame:
+        # Produces a deterministic intraday session so tests and offline use still
+        # exercise the session/intraday pipeline. We synthesize one trading day.
+        stable_symbol_seed = sum((idx + 1) * ord(char) for idx, char in enumerate(symbol.upper()))
+        rng = np.random.default_rng(self.seed + stable_symbol_seed + 991)
+        interval_minutes = max(1, _interval_to_minutes(interval.lower()) or 1)
+        bars_per_session = max(60, 390 // interval_minutes)
+        start = pd.Timestamp.now(tz="UTC").normalize().replace(hour=13, minute=30)  # 09:30 ET
+        index = pd.date_range(start=start, periods=bars_per_session, freq=f"{interval_minutes}min")
+        base_price = 100 + (stable_symbol_seed % 250)
+        increments = rng.normal(0.0002, 0.0015, bars_per_session)
+        closes = base_price * np.exp(np.cumsum(increments))
+        spread = np.maximum(closes * 0.0008, 0.05)
+        opens = closes * (1 + rng.normal(0.0, 0.0005, bars_per_session))
+        highs = np.maximum(opens, closes) + spread
+        lows = np.minimum(opens, closes) - spread
+        volume = rng.integers(15_000, 250_000, bars_per_session).astype(float)
+        return pd.DataFrame(
+            {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": volume},
+            index=index,
+        )
 
     def fetch(self, symbol: str, period: str, interval: str) -> pd.DataFrame:
         rows = _period_to_rows(period, interval)
@@ -108,6 +145,29 @@ class FallbackProvider:
         frame.attrs["provider"] = self.fallback.name
         return frame
 
+    def fetch_intraday(self, symbol: str, period: str, interval: str, prepost: bool = True) -> pd.DataFrame:
+        primary_fetcher = getattr(self.primary, "fetch_intraday", None)
+        if primary_fetcher is not None:
+            try:
+                frame = primary_fetcher(symbol, period=period, interval=interval, prepost=prepost)
+                if frame is not None and not frame.empty:
+                    frame.attrs["provider"] = self.primary.name
+                    return frame
+            except Exception as exc:
+                LOGGER.info(
+                    "Primary intraday provider %s failed for %s. Falling back to %s: %s",
+                    self.primary.name,
+                    symbol.upper(),
+                    self.fallback.name,
+                    exc,
+                )
+        fallback_fetcher = getattr(self.fallback, "fetch_intraday", None)
+        if fallback_fetcher is None:
+            raise RuntimeError(f"Fallback provider {self.fallback.name} does not support intraday data")
+        frame = fallback_fetcher(symbol, period=period, interval=interval, prepost=prepost)
+        frame.attrs["provider"] = self.fallback.name
+        return frame
+
 
 def get_market_data_provider(settings: Settings) -> MarketDataProvider:
     provider_name = str(settings.data.get("provider", "yfinance")).lower()
@@ -122,6 +182,37 @@ def get_market_data_provider(settings: Settings) -> MarketDataProvider:
     if settings.data.get("allow_synthetic_fallback", False):
         return FallbackProvider(provider, synthetic, min_rows=int(settings.data.get("min_rows", 80)))
     return provider
+
+
+def fetch_intraday_data(symbol: str, settings: Settings, provider: MarketDataProvider | None = None) -> pd.DataFrame | None:
+    """Fetch today's intraday bars (yfinance only). Returns None when unavailable so callers degrade gracefully."""
+    provider = provider or get_market_data_provider(settings)
+    intraday_cfg = settings.data.get("intraday", {}) or {}
+    if not intraday_cfg.get("enabled", True):
+        return None
+    period = str(intraday_cfg.get("period", "1d"))
+    interval = str(intraday_cfg.get("interval", "1m"))
+    prepost = bool(intraday_cfg.get("include_premarket", True))
+    cache_ttl = float(intraday_cfg.get("cache_ttl_seconds", 60) or 0)
+    cache_key = (getattr(provider, "name", "provider"), "intraday", symbol.upper(), period, interval, prepost)
+    if cache_ttl > 0:
+        _INTRADAY_CACHE.ttl_seconds = cache_ttl
+        cached = _INTRADAY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+    fetcher = getattr(provider, "fetch_intraday", None)
+    if fetcher is None:
+        return None
+    try:
+        frame = fetcher(symbol.upper(), period=period, interval=interval, prepost=prepost)
+    except Exception as exc:
+        LOGGER.info("Intraday fetch for %s failed: %s", symbol.upper(), exc)
+        return None
+    if frame is None or frame.empty:
+        return None
+    if cache_ttl > 0:
+        _INTRADAY_CACHE.set(cache_key, frame.copy())
+    return frame
 
 
 def fetch_market_data(symbol: str, settings: Settings, provider: MarketDataProvider | None = None) -> pd.DataFrame:

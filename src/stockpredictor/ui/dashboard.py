@@ -45,9 +45,17 @@ def main() -> None:
         _render_scanner(settings, symbols)
     with deep_dive_tab:
         default_symbol = symbols[0] if symbols else settings.dashboard.get("default_symbol", "AAPL")
-        selected_symbol = st.text_input("Symbol", value=str(default_symbol)).upper()
+        col_sym, col_horizon = st.columns([3, 1])
+        selected_symbol = col_sym.text_input("Symbol", value=str(default_symbol)).upper()
+        horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
+        default_horizon = settings.horizons.get("default", "swing")
+        try:
+            default_index = horizon_options.index(default_horizon)
+        except ValueError:
+            default_index = 0
+        selected_horizon = col_horizon.selectbox("Horizon", horizon_options, index=default_index)
         if st.button("Analyze", type="primary"):
-            _render_analysis(settings, selected_symbol)
+            _render_analysis(settings, selected_symbol, horizon=selected_horizon)
     with news_tab:
         _render_news(settings, symbols or settings.watchlist())
     with backtest_tab:
@@ -106,16 +114,78 @@ def _render_scanner(settings, symbols: list[str]) -> None:
         st.dataframe(df, use_container_width=True, hide_index=True, column_config=_scanner_column_config())
 
 
-def _render_analysis(settings, symbol: str) -> None:
-    result = analyze_symbol(symbol, settings)
+def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
+    result = analyze_symbol(symbol, settings, horizon=horizon)
     provider = get_market_data_provider(settings)
     frame = fetch_market_data(symbol, settings, provider)
+
+    session = result.session
+    live_price = session.live_price if session is not None else None
+    headline_price = live_price if live_price is not None else result.snapshot.latest_close
+    headline_label = "Live Price" if live_price is not None else "Last Close"
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Action", result.decision.action)
     col2.metric("Confidence", _format_percent(result.decision.confidence))
     col3.metric("Score", f"{result.decision.score:.3f}")
-    col4.metric("Last Price", _format_price(result.snapshot.latest_close), _format_percent(result.snapshot.change_pct))
+    col4.metric(
+        headline_label,
+        _format_price(headline_price),
+        _format_percent(result.snapshot.change_pct),
+    )
+
+    if session is not None and session.data_available:
+        st.caption(
+            f"Session: {session.market_session} ({session.bars_loaded} intraday bars). "
+            f"Horizon: {result.horizon}."
+        )
+        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+        sc1.metric("Session VWAP", _format_price(session.session_vwap) if session.session_vwap else "-")
+        sc2.metric("Session Open", _format_price(session.session_open) if session.session_open else "-")
+        sc3.metric("Session High", _format_price(session.session_high) if session.session_high else "-")
+        sc4.metric("Session Low", _format_price(session.session_low) if session.session_low else "-")
+        sc5.metric(
+            "TOD RVOL",
+            f"{session.time_of_day_rvol:.2f}" if session.time_of_day_rvol is not None else "-",
+        )
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Premarket High", _format_price(session.premarket_high) if session.premarket_high else "-")
+        pc2.metric("Premarket Low", _format_price(session.premarket_low) if session.premarket_low else "-")
+        pc3.metric("Opening Range", session.opening_range_status)
+    elif session is not None:
+        st.caption(f"Session: {session.market_session}. Intraday bars unavailable — analysis is daily-only.")
+
+    market_state = result.market_state
+    sector = result.sector_context
+    calendar = result.calendar
+    if market_state is not None or sector is not None or calendar is not None:
+        st.subheader("Context Cross-Check")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        if market_state is not None:
+            mc1.metric("SPY", _format_percent(market_state.spy_change_pct) if market_state.spy_change_pct is not None else "-")
+            mc2.metric("QQQ", _format_percent(market_state.qqq_change_pct) if market_state.qqq_change_pct is not None else "-")
+            mc3.metric("VIX", f"{market_state.vix_value:.2f}" if market_state.vix_value is not None else "-")
+        if sector is not None and sector.sector_etf:
+            mc4.metric(
+                f"{sector.sector_etf} ({sector.alignment})",
+                _format_percent(sector.sector_change_pct) if sector.sector_change_pct is not None else "-",
+            )
+        if calendar is not None and calendar.no_trade_flags:
+            st.warning("Calendar flags: " + "; ".join(calendar.no_trade_flags))
+
+    if result.previous_snapshots:
+        with st.expander(f"Compared to your last {len(result.previous_snapshots)} analyses"):
+            from stockpredictor.snapshots import diff_snapshots
+
+            prev = result.previous_snapshots[-1]
+            if result.snapshot_record is not None:
+                diff = diff_snapshots(result.snapshot_record, prev)
+                dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+                dcol1.metric("Δ Score", f"{diff['score_delta']:+.3f}" if diff.get("score_delta") is not None else "-")
+                dcol2.metric("Δ Confidence", f"{diff['confidence_delta']:+.3f}" if diff.get("confidence_delta") is not None else "-")
+                dcol3.metric("Δ Price", _format_price(diff["live_price_delta"]) if diff.get("live_price_delta") is not None else "-")
+                dcol4.metric("Action Changed?", "yes" if diff.get("action_changed") else "no")
+                st.caption(f"Previous action: {diff.get('previous_action', '-')} @ {diff.get('previous_timestamp', '-')}")
 
     st.subheader("Price And Levels")
     st.plotly_chart(

@@ -18,6 +18,75 @@ class MarketSnapshot:
 
 
 @dataclass
+class SessionContext:
+    """Today's intraday session state. Anchored on the regular session open in the configured timezone."""
+    symbol: str
+    as_of: str
+    market_session: str = "unknown"
+    minutes_since_open: int | None = None
+    minutes_to_close: int | None = None
+    live_price: float | None = None
+    session_open: float | None = None
+    session_high: float | None = None
+    session_low: float | None = None
+    session_vwap: float | None = None
+    premarket_high: float | None = None
+    premarket_low: float | None = None
+    premarket_volume: float | None = None
+    opening_range_high: float | None = None
+    opening_range_low: float | None = None
+    opening_range_status: str = "unavailable"
+    time_of_day_rvol: float | None = None
+    session_volume: float | None = None
+    bars_loaded: int = 0
+    interval: str = ""
+    data_available: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MarketState:
+    """Broad-market state used for cross-checking a single-symbol decision."""
+    as_of: str
+    spy_change_pct: float | None = None
+    qqq_change_pct: float | None = None
+    iwm_change_pct: float | None = None
+    vix_value: float | None = None
+    vix_change_pct: float | None = None
+    market_trend: str = "unknown"
+    risk_environment: str = "unknown"
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SectorContext:
+    """Sector ETF used to confirm or contradict a symbol's setup."""
+    symbol: str
+    sector_name: str = "unknown"
+    sector_etf: str = ""
+    sector_change_pct: float | None = None
+    sector_trend: str = "unknown"
+    alignment: str = "unknown"
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CalendarContext:
+    """Time-of-day, earnings, and macro-event awareness for the analyzed symbol."""
+    symbol: str
+    as_of: str
+    market_session: str = "unknown"
+    minutes_to_open: int | None = None
+    minutes_to_close: int | None = None
+    next_earnings_date: str | None = None
+    hours_to_earnings: float | None = None
+    earnings_within_24h: bool = False
+    macro_events_today: list[dict] = field(default_factory=list)
+    macro_events_next_24h: list[dict] = field(default_factory=list)
+    no_trade_flags: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FeatureSet:
     symbol: str
     as_of: str
@@ -116,6 +185,26 @@ class BacktestReport:
 
 
 @dataclass
+class AnalysisSnapshot:
+    """Compact serializable record of a single analyze run, persisted for delta comparisons."""
+    snapshot_id: str
+    symbol: str
+    timestamp: str
+    horizon: str
+    action: str
+    score: float
+    confidence: float
+    live_price: float | None
+    entry: float | None
+    stop_loss: float | None
+    target: float | None
+    risk_reward: float | None
+    market_session: str
+    top_reason: str
+    no_trade_flags: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AnalysisResult:
     snapshot: MarketSnapshot
     features: FeatureSet
@@ -124,3 +213,11 @@ class AnalysisResult:
     decision: SignalDecision
     risk_plan: RiskPlan
     scanner_row: dict[str, float | str | bool | None] = field(default_factory=dict)
+    horizon: str = "swing"
+    session: SessionContext | None = None
+    intraday_features: dict[str, float | str | None] = field(default_factory=dict)
+    market_state: MarketState | None = None
+    sector_context: SectorContext | None = None
+    calendar: CalendarContext | None = None
+    snapshot_record: AnalysisSnapshot | None = None
+    previous_snapshots: list[AnalysisSnapshot] = field(default_factory=list)

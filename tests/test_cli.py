@@ -11,7 +11,7 @@ def test_cli_accepts_config_on_subcommand_only(monkeypatch, capsys) -> None:
         return object()
 
     monkeypatch.setattr(cli, "load_settings", fake_load_settings)
-    monkeypatch.setattr(cli, "scan_symbols", lambda settings, symbols=None: [])
+    monkeypatch.setattr(cli, "scan_symbols", lambda *args, **kwargs: [])
 
     assert cli.main(["scan", "--config", "configs/custom.yaml"]) == 0
 

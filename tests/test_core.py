@@ -409,6 +409,112 @@ def test_trade_journal_roundtrip(tmp_path: Path) -> None:
     assert entries[-1]["setup_type"] == "vwap_reclaim"
 
 
+def test_session_context_from_synthetic_intraday(tmp_path: Path) -> None:
+    from stockpredictor.data import SyntheticProvider
+    from stockpredictor.session import build_session_context
+
+    settings = _test_settings(tmp_path)
+    provider = SyntheticProvider()
+    intraday = provider.fetch_intraday("TEST", period="1d", interval="1m")
+    session = build_session_context("TEST", intraday, settings)
+
+    assert session.bars_loaded > 0
+    assert session.live_price is not None
+    # synthetic frame anchored to today's regular session in UTC translated to ET; session VWAP
+    # must compute to a real number whenever bars are loaded.
+    assert session.session_vwap is not None or session.session_open is not None
+
+
+def test_horizon_profile_overrides_atr_multiple(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["horizons"] = {
+        "default": "swing",
+        "profiles": {
+            "intraday": {"horizon_days": 1, "lookback_rows": 30, "atr_stop_multiple": 0.5, "target_r_multiple": 1.0},
+            "swing": {"horizon_days": 5, "lookback_rows": 80, "atr_stop_multiple": 1.5, "target_r_multiple": 1.5},
+        },
+    }
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    assert settings.horizon_profile("intraday")["atr_stop_multiple"] == 0.5
+    assert settings.horizon_profile()["atr_stop_multiple"] == 1.5  # default
+    assert settings.horizon_profile("nonexistent")["atr_stop_multiple"] == 1.5  # falls back
+
+
+def test_snapshots_persist_and_diff(tmp_path: Path) -> None:
+    from stockpredictor.contracts import AnalysisResult, ContextSummary, FeatureSet, MarketSnapshot, RiskPlan, SessionContext, SignalDecision
+    from stockpredictor.snapshots import diff_snapshots, load_snapshots, record_snapshot
+
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["snapshots"] = {"enabled": True, "path": "snapshots.local.jsonl", "compare_window": 3}
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    def build(score: float, confidence: float, action: str, price: float) -> AnalysisResult:
+        return AnalysisResult(
+            snapshot=MarketSnapshot(symbol="TEST", as_of="t", timeframe="1d", provider="synthetic", rows=80, latest_close=price, latest_volume=1_000_000),
+            features=FeatureSet(symbol="TEST", as_of="t", latest_price=price),
+            predictions=[],
+            context=ContextSummary(symbol="TEST", enabled=False, score=0.0, sentiment="neutral"),
+            decision=SignalDecision(symbol="TEST", action=action, confidence=confidence, score=score, timeframe="1d", top_reason="trend is up"),
+            risk_plan=RiskPlan(symbol="TEST", action=action, entry=price, stop_loss=price - 1, targets=[price + 1.5], risk_reward=1.5),
+            session=SessionContext(symbol="TEST", as_of="t", market_session="regular_morning", live_price=price),
+        )
+
+    first = record_snapshot(settings, build(0.4, 0.55, "long", 100.0), horizon="swing")
+    second = record_snapshot(settings, build(0.62, 0.71, "long", 102.5), horizon="swing")
+    loaded = load_snapshots(settings, "TEST", limit=10)
+
+    assert len(loaded) == 2
+    assert loaded[-1].snapshot_id == second.snapshot_id
+    diff = diff_snapshots(second, first)
+    assert round(diff["score_delta"], 2) == 0.22
+    assert round(diff["live_price_delta"], 2) == 2.5
+    assert diff["action_changed"] is False
+
+
+def test_news_freshness_promotes_recent_items(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from stockpredictor.news import build_news_feed
+
+    settings = _test_settings(tmp_path)
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(minutes=5)).isoformat()
+    stale = (now - timedelta(hours=12)).isoformat()
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50: [
+            {"symbol": "TEST", "title": "Old guidance recap", "url": "https://example.com/old", "published": stale, "impact": 0.4, "sentiment": "bullish"},
+            {"symbol": "TEST", "title": "TEST raises guidance", "url": "https://example.com/new", "published": fresh, "impact": 0.5, "sentiment": "bullish"},
+        ],
+    )
+
+    feed = build_news_feed(["TEST"], settings, limit=10)
+    headlines = feed["headlines"]
+
+    assert headlines[0]["title"] == "TEST raises guidance"
+    assert headlines[0]["freshness"] > headlines[1]["freshness"]
+    assert feed["fresh_catalyst_count"] == 1
+
+
+def test_calendar_no_trade_flag_for_earnings_within_24h(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from stockpredictor.calendar import build_calendar_context
+
+    settings = _test_settings(tmp_path)
+    in_three_hours = datetime.now(timezone.utc) + timedelta(hours=3)
+    monkeypatch.setattr("stockpredictor.calendar._next_earnings_date", lambda symbol: in_three_hours)
+
+    context = build_calendar_context("TEST", settings)
+
+    assert context.earnings_within_24h is True
+    assert any("earnings inside 24h" in flag for flag in context.no_trade_flags)
+
+
 def test_backtest_exit_simulation_paths() -> None:
     index = pd.date_range("2026-01-01", periods=3, freq="D")
     target_window = pd.DataFrame({"High": [101, 106, 107], "Low": [99, 100, 101]}, index=index)
