@@ -395,6 +395,8 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
 
     _render_trade_plan_summary(result)
 
+    _render_news_decision_panel(result)
+
     if result.previous_snapshots:
         with _remembered_expander(f"Compared to your last {len(result.previous_snapshots)} analyses", f"analysis_compare_{result.snapshot.symbol}", expanded=False):
             from stockpredictor.snapshots import diff_snapshots
@@ -489,6 +491,114 @@ def _render_trade_plan_summary(result) -> None:
         st.warning("No-trade reasons: " + "; ".join(plan.no_trade_reasons))
     if plan.session_checks:
         st.caption(_session_check_text(plan.session_checks))
+
+
+def _render_news_decision_panel(result) -> None:
+    """White-box view: shows whether news was gathered and exactly how it moved the
+    fused score, tying the News-tab style summary directly to the trade decision."""
+    st.subheader("How News Shaped This Decision")
+    context = result.context
+    news = context.news_analysis or {}
+    evidence = context.evidence or []
+    considered = bool(news or evidence)
+
+    if not considered:
+        st.info(
+            "No news evidence was gathered for this decision. The action below relies on "
+            "models, technicals, and configured context only. Enable "
+            "`context_agent.news_analysis` (and `use_in_decision`) to feed news into the decision."
+        )
+        _render_score_attribution(result.decision)
+        return
+
+    provider = str(news.get("analysis_provider", "heuristic"))
+    freshness_values = [float(item.get("freshness", 0.0) or 0.0) for item in evidence]
+    top_freshness = max(freshness_values) if freshness_values else 0.0
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("News considered", f"Yes ({provider})", help="Whether a news summary was gathered and fed into this decision, and by which analyzer.")
+    b2.metric("Headlines used", len(evidence), help="Number of headlines actually passed into this decision as evidence.")
+    b3.metric("Top freshness", _format_percent(top_freshness), help=HELP_TEXT["freshness"])
+    b4.metric("Category", str(news.get("dominant_category", "other")).replace("_", " "), help="Most common catalyst/category among the headlines used.")
+
+    grand_summary = str(news.get("grand_summary", "")).strip()
+    if grand_summary:
+        st.write(grand_summary)
+
+    focus = news.get("day_trader_focus", {}) if isinstance(news.get("day_trader_focus"), dict) else {}
+    if focus:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"question": "Catalyst", "answer": focus.get("catalyst", "-")},
+                    {"question": "Risk", "answer": focus.get("risk", "-")},
+                    {"question": "Tradeability", "answer": focus.get("tradeability", "-")},
+                    {"question": "No-trade flags", "answer": "; ".join(focus.get("no_trade_flags", [])) or "-"},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "question": st.column_config.TextColumn("Question", help="Trader question the news summary answers."),
+                "answer": st.column_config.TextColumn("Answer", help="LLM or heuristic summary for this decision question."),
+            },
+        )
+
+    if provider == "heuristic_fallback":
+        st.warning(f"Heuristic fallback summary was used. LLM error: {news.get('llm_error', 'unknown error')}")
+    elif provider == "llm_error":
+        st.warning(f"LLM summary failed; headlines below are still available. Error: {news.get('llm_error', 'unknown error')}")
+
+    _render_score_attribution(result.decision)
+
+    if evidence:
+        with _remembered_expander(f"Headlines used in this decision ({len(evidence)})", f"decision_news_evidence_{result.snapshot.symbol}", expanded=False):
+            ev_df = pd.DataFrame(evidence)
+            columns = [column for column in ["provider", "published", "category", "sentiment", "impact", "day_trader_relevance", "freshness", "title", "url"] if column in ev_df.columns]
+            st.dataframe(ev_df[columns], use_container_width=True, hide_index=True, column_config=_headline_column_config())
+
+
+def _render_score_attribution(decision) -> None:
+    breakdown = list(decision.score_breakdown or [])
+    if not breakdown:
+        return
+    rows = [
+        {
+            "input": _humanize_key(str(row.get("component", ""))),
+            "kind": str(row.get("kind", "")),
+            "raw_score": row.get("raw_score"),
+            "weight": row.get("weight"),
+            "contribution": row.get("contribution"),
+        }
+        for row in breakdown
+    ]
+    news_contribution = sum(
+        float(row.get("contribution", 0.0) or 0.0)
+        for row in breakdown
+        if row.get("kind") == "component" and str(row.get("component")) in {"context", "sentiment"}
+    )
+    news_penalty = sum(
+        float(row.get("contribution", 0.0) or 0.0)
+        for row in breakdown
+        if row.get("kind") == "penalty" and "news" in str(row.get("component", "")).lower()
+    )
+    with _remembered_expander("Score attribution (white box)", f"decision_score_attribution_{decision.symbol}", expanded=True):
+        st.caption(
+            f"News-driven inputs (context + sentiment) contributed {news_contribution:+.3f} of the "
+            f"{decision.score:.3f} fused score"
+            + (f"; news no-trade flags then applied {news_penalty:+.3f}." if news_penalty else ".")
+        )
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "input": st.column_config.TextColumn("Input", help="Signal component or penalty applied to the fused score."),
+                "kind": st.column_config.TextColumn("Kind", help="component = weighted input; penalty = multiplicative confidence shave."),
+                "raw_score": st.column_config.NumberColumn("Raw", format="%.3f", help="Component score before weighting (blank for penalties)."),
+                "weight": st.column_config.NumberColumn("Weight/Factor", format="%.2f", help="Fusion weight for components; multiplier for penalties."),
+                "contribution": st.column_config.NumberColumn("Contribution", format="%+.3f", help="Signed amount this input added to (or removed from) the fused score."),
+            },
+        )
 
 
 def _render_context_panel(result) -> None:

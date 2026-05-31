@@ -125,6 +125,11 @@ class ContextSummary:
     features: dict[str, float | str | bool] = field(default_factory=dict)
     reasons_to_trade: list[str] = field(default_factory=list)
     reasons_to_skip: list[str] = field(default_factory=list)
+    # White-box news provenance: the LLM/heuristic per-symbol summary that fed this
+    # context (provider, grand_summary, day_trader_focus, dominant_category) and the
+    # exact headlines used as evidence. Empty when no news analysis was supplied.
+    news_analysis: dict[str, Any] = field(default_factory=dict)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -140,6 +145,10 @@ class SignalDecision:
     context_score: float = 0.0
     created_at: str = ""
     top_reason: str = ""
+    # Per-component attribution so the UI can show, in a white-box way, how each
+    # input (models/technicals/intraday/context/sentiment) and each penalty moved
+    # the fused score. Each row: {component, raw_score, weight, contribution, kind}.
+    score_breakdown: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

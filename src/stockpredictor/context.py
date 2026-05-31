@@ -25,7 +25,20 @@ POSITIVE_WORDS = {"beat", "beats", "raise", "raises", "upgrade", "growth", "appr
 NEGATIVE_WORDS = {"miss", "misses", "cut", "downgrade", "probe", "lawsuit", "weak", "warning", "delay", "risk", "recall"}
 
 
-def build_context_summary(symbol: str, settings: Settings, include_live_sources: bool = True) -> ContextSummary:
+def build_context_summary(
+    symbol: str,
+    settings: Settings,
+    include_live_sources: bool = True,
+    news_analysis: dict[str, Any] | None = None,
+) -> ContextSummary:
+    """Build the catalyst/context summary that feeds the signal fusion.
+
+    When ``news_analysis`` is supplied (the deep-dive path; see
+    ``news.analyze_symbol_news``), its enriched headlines drive the catalyst score
+    and the rich LLM summary is attached for white-box display, so the trade
+    decision both consumes and exposes the gathered news. When it is ``None`` (the
+    scanner path), the lightweight live-fetch behavior is used as before.
+    """
     cfg = settings.context_agent
     mind_file = _resolve_mind_file(settings, str(cfg.get("mind_file", "traders.mind.md")))
     checklist = _load_trader_checklist(mind_file)
@@ -44,7 +57,11 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
     sources = [str(source) for source in cfg.get("sources", [])]
     if "manual" in sources:
         items.extend(cfg.get("manual_items", []))
-    if include_live_sources and any(source in sources for source in DEFAULT_NEWS_SOURCES):
+    news_headlines = [dict(item) for item in (news_analysis or {}).get("headlines", [])]
+    if news_headlines:
+        # Reuse the same scoring loop with the already-enriched, LLM-aware headlines.
+        items.extend(news_headlines)
+    elif include_live_sources and any(source in sources for source in DEFAULT_NEWS_SOURCES):
         items.extend(fetch_news_items([symbol], limit=int(cfg.get("news_limit", 8)), sources=sources, source_config=cfg.get("news_analysis", {})))
 
     catalysts: list[str] = []
@@ -74,6 +91,16 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             reasons_to_skip.append(f"context risk: {title}")
 
     catalyst_score = clamp(sum(score_parts) / len(score_parts), -1.0, 1.0) if score_parts else 0.0
+    # Merge the LLM's net directional stance into the catalyst score so its read of
+    # the news actually moves (and visibly shapes) the decision, instead of only the
+    # headline keyword impacts. Heuristic stances are not blended in — they already
+    # equal the keyword view, so blending would double-count.
+    news_payload = _news_analysis_payload(news_analysis)
+    news_stance_score = _llm_stance_score(news_payload)
+    keyword_catalyst_score = catalyst_score
+    if news_stance_score is not None:
+        stance_weight = float(cfg.get("news_analysis", {}).get("llm_stance_weight", 0.6))
+        catalyst_score = clamp(stance_weight * news_stance_score + (1.0 - stance_weight) * catalyst_score, -1.0, 1.0)
     catalyst_freshness = clamp(sum(freshness_parts) / len(freshness_parts), 0.0, 1.0) if freshness_parts else 0.0
     market_alignment_present = any(part != 0 for part in market_alignment_parts)
     sector_alignment_present = any(part != 0 for part in sector_alignment_parts)
@@ -96,6 +123,14 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
         reasons_to_skip.append("context score is negative")
     if score > 0 and catalysts:
         reasons_to_trade.append("context supports the setup")
+
+    # Fold the rich news analysis (LLM or heuristic) into the context: surface its
+    # no-trade flags as reasons-to-skip and keep its summary as white-box evidence.
+    news_focus = news_payload.get("day_trader_focus", {}) if news_payload else {}
+    news_no_trade_flags = [str(flag) for flag in news_focus.get("no_trade_flags", []) if str(flag).strip()]
+    for flag in news_no_trade_flags:
+        reasons_to_skip.append(f"news no-trade flag: {flag}")
+
     raw_summary = _summarize_context(symbol, catalysts, risks, mind_file, checklist)
     return ContextSummary(
         symbol=symbol.upper(),
@@ -116,10 +151,63 @@ def build_context_summary(symbol: str, settings: Settings, include_live_sources:
             "sector_alignment": sector_alignment,
             "checklist_items": float(len(checklist)),
             "news_llm_enabled": bool(cfg.get("news_analysis", {}).get("llm", {}).get("enabled", False)),
+            "news_no_trade_flag_count": float(len(news_no_trade_flags)),
+            "news_stance_score": float(news_stance_score) if news_stance_score is not None else 0.0,
+            "keyword_catalyst_score": keyword_catalyst_score,
         },
         reasons_to_trade=dedupe_preserve_order(reasons_to_trade)[:8],
         reasons_to_skip=dedupe_preserve_order(reasons_to_skip)[:8],
+        news_analysis=news_payload,
+        evidence=news_headlines,
     )
+
+
+def _news_analysis_payload(news_analysis: dict[str, Any] | None) -> dict[str, Any]:
+    """Compact, display-ready slice of a per-symbol news summary for white-box UI.
+
+    Drops the heavy ``sources`` list (the headlines are carried separately as
+    ``evidence``) and keeps only the fields the decision panel renders.
+    """
+    if not news_analysis:
+        return {}
+    summary = news_analysis.get("summary", {}) or {}
+    if not summary:
+        return {}
+    keys = (
+        "grand_summary",
+        "dominant_category",
+        "day_trader_focus",
+        "stance",
+        "stance_score",
+        "analysis_provider",
+        "llm_notes",
+        "llm_error",
+        "bullish_count",
+        "bearish_count",
+        "neutral_count",
+        "headline_count",
+        "source_count",
+    )
+    return {key: summary[key] for key in keys if key in summary}
+
+
+def _llm_stance_score(news_payload: dict[str, Any]) -> float | None:
+    """Signed stance score from the news summary, only when it came from a real LLM.
+
+    Heuristic stances mirror the keyword catalyst score, so they are intentionally
+    excluded here to avoid double-counting the same signal.
+    """
+    if not news_payload:
+        return None
+    if str(news_payload.get("analysis_provider", "")) not in {"localdeploy", "openai"}:
+        return None
+    raw = news_payload.get("stance_score")
+    if raw is None:
+        return None
+    try:
+        return clamp(float(raw), -1.0, 1.0)
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_news_items(

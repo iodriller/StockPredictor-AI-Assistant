@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import yaml
 
 from stockpredictor.backtesting import _excursions, _simulate_exit, run_backtest
@@ -92,6 +93,104 @@ def test_signal_fusion_allows_non_actionable_output(tmp_path: Path) -> None:
     context = ContextSummary(symbol="TEST", enabled=False, score=0.0, sentiment="neutral")
     decision = fuse_signals("TEST", features, predictions, context, settings)
     assert decision.action in {"no_trade", "low_confidence"}
+
+
+def _bullish_features() -> FeatureSet:
+    return FeatureSet(
+        symbol="TEST",
+        as_of="2026-01-01T00:00:00",
+        latest_price=100.0,
+        indicators={},
+        regime="trending",
+        technical_score=0.5,
+        reasons=["technical signal is positive"],
+    )
+
+
+def _bullish_prediction() -> ModelPrediction:
+    return ModelPrediction(
+        model="baseline",
+        symbol="TEST",
+        horizon_days=5,
+        direction="up",
+        expected_return=0.04,
+        confidence=0.7,
+        predicted_price=104.0,
+    )
+
+
+def test_score_breakdown_contributions_sum_to_score(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    context = ContextSummary(symbol="TEST", enabled=True, score=0.5, sentiment="bullish")
+    decision = fuse_signals("TEST", _bullish_features(), [_bullish_prediction()], context, settings)
+
+    assert decision.score_breakdown
+    total = sum(float(row["contribution"]) for row in decision.score_breakdown)
+    assert total == pytest.approx(decision.score, abs=1e-9)
+    components = {row["component"] for row in decision.score_breakdown if row["kind"] == "component"}
+    assert {"models", "technicals", "context", "sentiment"}.issubset(components)
+
+
+def test_news_no_trade_flags_apply_soft_penalty(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    features = _bullish_features()
+    predictions = [_bullish_prediction()]
+    base_context = ContextSummary(symbol="TEST", enabled=True, score=0.5, sentiment="bullish")
+    flagged_context = ContextSummary(
+        symbol="TEST",
+        enabled=True,
+        score=0.5,
+        sentiment="bullish",
+        features={"news_no_trade_flag_count": 2.0},
+        reasons_to_skip=["news no-trade flag: late extension"],
+    )
+
+    base = fuse_signals("TEST", features, predictions, base_context, settings)
+    flagged = fuse_signals("TEST", features, predictions, flagged_context, settings)
+
+    penalty = float(settings.signal_fusion["thresholds"]["news_no_trade_penalty"])
+    assert flagged.score == pytest.approx(base.score * (1 - penalty), abs=1e-9)
+    assert flagged.score < base.score  # soft shave, not a hard block
+    assert any("news no-trade flags" in reason for reason in flagged.reasons)
+    assert any(row.get("kind") == "penalty" and "news" in row["component"].lower() for row in flagged.score_breakdown)
+
+
+def test_context_consumes_news_analysis_evidence(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    news_analysis = {
+        "symbol": "TEST",
+        "summary": {
+            "symbol": "TEST",
+            "grand_summary": "TEST momentum on AI demand",
+            "dominant_category": "product_business",
+            "analysis_provider": "localdeploy",
+            "day_trader_focus": {
+                "catalyst": "AI demand",
+                "risk": "late extension",
+                "tradeability": "confirm with VWAP",
+                "no_trade_flags": ["late extension"],
+            },
+        },
+        "headlines": [
+            {
+                "symbol": "TEST",
+                "title": "TEST raises guidance",
+                "url": "https://example.com/1",
+                "impact": 0.5,
+                "sentiment": "bullish",
+                "freshness": 0.9,
+                "category": "earnings_guidance",
+            }
+        ],
+    }
+
+    context = build_context_summary("TEST", settings, news_analysis=news_analysis)
+
+    assert context.evidence and context.evidence[0]["title"] == "TEST raises guidance"
+    assert context.news_analysis["grand_summary"] == "TEST momentum on AI demand"
+    assert context.features["news_no_trade_flag_count"] == 1.0
+    assert any("late extension" in reason for reason in context.reasons_to_skip)
+    assert context.score > 0
 
 
 def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:

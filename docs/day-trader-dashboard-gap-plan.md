@@ -46,6 +46,12 @@ workflow sources. It is research and product planning, not financial advice.
 - Context now classifies catalyst categories, impact, sentiment, source count,
   headline relevance, and day-trader focus. Credibility scoring is still basic
   because free providers do not expose source reliability metadata.
+- News is now wired into the decision (not just displayed): deep-dive analysis
+  folds the per-symbol news summary into the fused context/sentiment score, LLM
+  no-trade flags apply a soft confidence shave, and the Trade Plan shows a
+  white-box "How News Shaped This Decision" panel with the gathered summary, the
+  exact headlines used, and a per-component score attribution. See
+  `docs/news-in-decision-plan.md`.
 - Backtesting now records stop/target/time exits, slippage/commission, R
   multiple, MAE/MFE, setup quality, top reason, and no-trade logs. True intraday
   strategy testing still needs intraday bars.

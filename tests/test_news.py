@@ -8,7 +8,7 @@ from stockpredictor.config import load_settings
 from stockpredictor.context import fetch_news_items
 import pytest
 
-from stockpredictor.news import NewsAnalysisError, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, build_news_feed
+from stockpredictor.news import NewsAnalysisError, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, analyze_symbol_news, build_news_feed
 
 
 def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch) -> None:
@@ -35,6 +35,32 @@ def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch
     assert "guidance" in feed["summaries"][0]["grand_summary"].lower()
     assert feed["summaries"][0]["day_trader_focus"]["catalyst"]
     assert feed["headlines"][0]["category"] == "earnings_guidance"
+
+
+def test_analyze_symbol_news_returns_summary_and_evidence(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50, **kwargs: [
+            {
+                "symbol": "TEST",
+                "title": "TEST raises guidance after earnings beat",
+                "provider": "Fixture News",
+                "published": "2026-01-01T09:30:00Z",
+                "url": "https://example.com/test",
+                "impact": 0.5,
+                "sentiment": "bullish",
+            }
+        ],
+    )
+
+    result = analyze_symbol_news("test", settings, limit=10)
+
+    assert result["symbol"] == "TEST"
+    assert result["summary"]["symbol"] == "TEST"
+    assert result["headlines"]
+    assert result["headlines"][0]["category"] == "earnings_guidance"
+    assert result["summary"]["day_trader_focus"]["catalyst"]
 
 
 def test_news_feed_uses_requested_limit_for_symbol_summary(tmp_path: Path, monkeypatch) -> None:

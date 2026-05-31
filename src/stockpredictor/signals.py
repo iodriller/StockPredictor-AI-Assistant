@@ -34,13 +34,20 @@ def fuse_signals(
     context_score = clamp(context.score, -1.0, 1.0)
     sentiment_score = {"bullish": 0.4, "bearish": -0.4}.get(context.sentiment, 0.0)
     intraday_component = clamp(float(intraday_score), -1.0, 1.0)
-    score = (
-        weights.get("models", 0.0) * model_score
-        + weights.get("technicals", 0.0) * technical_score
-        + weights.get("intraday", 0.0) * intraday_component
-        + weights.get("context", 0.0) * context_score
-        + weights.get("sentiment", 0.0) * sentiment_score
-    )
+    # Record each weighted component so the UI can show, in a white-box way, how
+    # much each input (including news-driven context/sentiment) moved the score.
+    components = [
+        ("models", model_score, float(weights.get("models", 0.0))),
+        ("technicals", technical_score, float(weights.get("technicals", 0.0))),
+        ("intraday", intraday_component, float(weights.get("intraday", 0.0))),
+        ("context", context_score, float(weights.get("context", 0.0))),
+        ("sentiment", sentiment_score, float(weights.get("sentiment", 0.0))),
+    ]
+    score_breakdown: list[dict] = [
+        {"component": name, "raw_score": raw, "weight": weight, "contribution": weight * raw, "kind": "component"}
+        for name, raw, weight in components
+    ]
+    score = sum(weight * raw for _, raw, weight in components)
     reasons = list(features.reasons)
     if intraday_reasons:
         reasons.extend(intraday_reasons[:3])
@@ -52,7 +59,7 @@ def fuse_signals(
     reasons.extend(context.reasons_to_skip[:2])
     if disagreement:
         penalty = float(thresholds.get("disagreement_penalty", 0.18))
-        score *= 1 - penalty
+        score = _record_penalty(score, 1 - penalty, "model disagreement", score_breakdown)
         reasons.append("model disagreement reduced confidence")
 
     # Calendar hard-blocks: earnings within 24h, market closed, high-impact macro event.
@@ -62,14 +69,31 @@ def fuse_signals(
 
     # Market/sector light penalty: shave confidence if market is risk-off or sector diverges.
     if market_state is not None and market_state.risk_environment == "elevated":
-        score *= 0.85
+        score = _record_penalty(score, 0.85, "elevated VIX", score_breakdown)
         reasons.append("VIX is elevated; downweighting confidence")
     if sector_context is not None and sector_context.alignment == "divergent":
-        score *= 0.90
+        score = _record_penalty(score, 0.90, f"sector divergence ({sector_context.sector_etf})", score_breakdown)
         reasons.append(f"symbol is diverging from sector ETF ({sector_context.sector_etf})")
 
+    # Soft news penalty: LLM/heuristic no-trade flags from the news analysis shave
+    # confidence and are surfaced as reasons, but never force an action on their own.
+    news_flag_count = int(float(context.features.get("news_no_trade_flag_count", 0) or 0))
+    if news_flag_count > 0:
+        news_penalty = float(thresholds.get("news_no_trade_penalty", 0.15))
+        score = _record_penalty(score, 1 - news_penalty, f"news no-trade flags ({news_flag_count})", score_breakdown)
+        reasons.append("news no-trade flags reduced confidence")
+
     component_confidence = _average([prediction.confidence for prediction in predictions if prediction.confidence > 0])
-    confidence = clamp(abs(score) * 0.75 + component_confidence * 0.35 - (0.12 if disagreement else 0), 0.0, 1.0)
+    # Confidence weighting is config-driven so the no-trade calibration can be tuned
+    # without code changes. Defaults preserve the original behavior.
+    score_weight = float(thresholds.get("confidence_score_weight", 0.75))
+    component_weight = float(thresholds.get("confidence_component_weight", 0.35))
+    disagreement_conf_penalty = float(thresholds.get("disagreement_confidence_penalty", 0.12))
+    confidence = clamp(
+        abs(score) * score_weight + component_confidence * component_weight - (disagreement_conf_penalty if disagreement else 0),
+        0.0,
+        1.0,
+    )
     action = _action_from_score(score, confidence, thresholds)
     if hard_blockers:
         action = "no_trade"
@@ -94,7 +118,23 @@ def fuse_signals(
         context_score=context_score,
         created_at=now_in_timezone_iso(str(settings.app.get("timezone", "UTC"))),
         top_reason=deduped_reasons[0] if deduped_reasons else "",
+        score_breakdown=score_breakdown,
     )
+
+
+def _record_penalty(score: float, factor: float, label: str, breakdown: list[dict]) -> float:
+    """Apply a multiplicative penalty and record its signed contribution to the score."""
+    new_score = score * factor
+    breakdown.append(
+        {
+            "component": label,
+            "raw_score": None,
+            "weight": factor,
+            "contribution": new_score - score,
+            "kind": "penalty",
+        }
+    )
+    return new_score
 
 
 def _resolve_weights(settings: Settings, horizon_profile: dict) -> dict[str, float]:

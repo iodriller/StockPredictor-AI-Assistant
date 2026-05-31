@@ -80,8 +80,14 @@ signal_fusion:
     long_score: 0.35
     short_score: -0.35
     watch_score: 0.18
-    min_confidence: 0.35
+    min_confidence: 0.30
     disagreement_penalty: 0.18
+    news_no_trade_penalty: 0.15   # soft confidence shave per-decision when the news analysis raises no-trade flags
+    # Confidence calibration. Higher component weight lets a clear directional signal
+    # with confident models reach actionable confidence instead of stalling at no_trade.
+    confidence_score_weight: 0.60
+    confidence_component_weight: 0.50
+    disagreement_confidence_penalty: 0.12
 
 risk:
   account_size: 100000
@@ -90,7 +96,7 @@ risk:
   min_risk_reward: 1.5
   atr_stop_multiple: 1.5
   target_r_multiple: 1.5
-  min_confidence_for_trade: 0.45
+  min_confidence_for_trade: 0.40
   skip_if_atr_pct_above: 0.12
   min_avg_volume: 500000
   max_entry_distance_from_vwap_pct: 0.08
@@ -126,6 +132,8 @@ context_agent:
       impact: 0.0
   news_analysis:
     enabled: true
+    use_in_decision: true   # fold the per-symbol news summary into the trade decision (deep-dive only); false restores news-as-display-only
+    llm_stance_weight: 0.6  # how much the LLM's net stance (direction x conviction) overrides the keyword catalyst score in the decision
     max_headlines_per_symbol: 50
     source_count_clickthrough: true
     google_news_rss:

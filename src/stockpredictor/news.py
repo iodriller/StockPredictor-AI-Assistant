@@ -95,6 +95,42 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50, pro
     }
 
 
+def analyze_symbol_news(symbol: str, settings: Settings, limit: int | None = None) -> dict[str, Any]:
+    """Single-symbol news analysis for decision integration.
+
+    Reuses the same enrichment, excerpt, and summarization path as the News tab,
+    but returns just one symbol's summary plus the exact headlines used as
+    evidence. This lets the decision layer both consume the signal and show, in a
+    white-box way, what news fed the trade decision. Resilient by design: if the
+    configured LLM is unavailable it falls back to a heuristic/error summary rather
+    than raising, so the analysis pipeline never crashes on a news outage.
+    """
+    cfg = settings.context_agent.get("news_analysis", {})
+    symbol = symbol.strip().upper()
+    max_per_symbol = int(cfg.get("max_headlines_per_symbol", 50))
+    # An explicit caller-supplied limit (the dashboard actuator) overrides the
+    # config cap, so a trader can pull more than the default headline count.
+    summary_limit = max(1, int(limit)) if limit else max(1, max_per_symbol)
+    headline_sources = _configured_headline_sources(settings)
+    all_items = fetch_news_items([symbol], limit=summary_limit, sources=headline_sources, source_config=cfg)
+    enriched = [_enrich_item(item) for item in all_items if str(item.get("symbol", "")).upper() == symbol or not item.get("symbol")]
+    enriched = _attach_article_excerpts(enriched, cfg)
+    enriched.sort(
+        key=lambda item: (
+            float(item.get("freshness", 0.0)) * float(item.get("day_trader_relevance", 0.0)),
+            float(item.get("freshness", 0.0)),
+            abs(float(item.get("impact", 0.0))),
+        ),
+        reverse=True,
+    )
+    clipped = enriched[:summary_limit]
+    try:
+        summary = _summarize_symbol_news(symbol, clipped, settings)
+    except NewsAnalysisError as exc:
+        summary = _llm_error_symbol_summary(symbol, clipped, str(exc))
+    return {"symbol": symbol, "summary": summary, "headlines": clipped}
+
+
 def _summarize_symbol_news(symbol: str, items: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
     heuristic = _heuristic_symbol_summary(symbol, items)
     llm_summary = _llm_symbol_summary(symbol, items, settings)
@@ -120,6 +156,9 @@ def _heuristic_symbol_summary(symbol: str, items: list[dict[str, Any]]) -> dict[
     catalysts = [item["title"] for item in items if float(item.get("impact", 0)) > 0.15][:3]
     risks = [item["title"] for item in items if float(item.get("impact", 0)) < -0.15][:3]
     top_category = max(categories, key=categories.get) if categories else "other"
+    impacts = [float(item.get("impact", 0.0) or 0.0) for item in items]
+    stance_score = clamp(sum(impacts) / len(impacts), -1.0, 1.0) if impacts else 0.0
+    stance_direction = "bullish" if stance_score > 0.15 else "bearish" if stance_score < -0.15 else "neutral"
     if not items:
         grand_summary = f"No recent configured headlines were returned for {symbol}."
     elif catalysts or risks:
@@ -141,6 +180,8 @@ def _heuristic_symbol_summary(symbol: str, items: list[dict[str, Any]]) -> dict[
         "neutral_count": len(neutral),
         "dominant_category": top_category,
         "categories": categories,
+        "stance": {"direction": stance_direction, "conviction": abs(stance_score)},
+        "stance_score": stance_score,
         "day_trader_focus": {
             "catalyst": catalysts[0] if catalysts else "No strong fresh catalyst detected.",
             "risk": risks[0] if risks else "No obvious headline risk detected.",
@@ -218,8 +259,12 @@ def _news_llm_instructions() -> str:
         "tradeability, no-trade flags, and why the headlines may or may not matter. "
         "Use article_excerpt fields when present; otherwise rely only on the provided headline metadata. "
         "Do not give financial advice or tell the user to buy or sell. "
-        "Return keys: grand_summary, dominant_category, day_trader_focus, notes. "
-        "day_trader_focus must contain catalyst, risk, tradeability, no_trade_flags."
+        "Also return a structured stance summarizing the net directional read of the news: "
+        "stance.direction is one of bullish, bearish, neutral; stance.conviction is a number from 0 to 1 "
+        "reflecting how strongly the headlines support that direction. This stance is an evidence summary, not advice. "
+        "Return keys: grand_summary, dominant_category, day_trader_focus, stance, notes. "
+        "day_trader_focus must contain catalyst, risk, tradeability, no_trade_flags. "
+        "stance must contain direction and conviction."
     )
 
 
@@ -283,13 +328,36 @@ def _normalize_llm_summary(parsed: dict[str, Any], provider: str) -> dict[str, A
         notes = [notes]
     elif not isinstance(notes, list):
         notes = []
+    direction, conviction, stance_score = _normalize_stance(parsed.get("stance"))
     return {
         "grand_summary": str(parsed.get("grand_summary", "")),
         "dominant_category": str(parsed.get("dominant_category", "other")),
         "day_trader_focus": focus,
+        "stance": {"direction": direction, "conviction": conviction},
+        "stance_score": stance_score,
         "llm_notes": [str(note) for note in notes],
         "analysis_provider": provider,
     }
+
+
+def _normalize_stance(stance: object) -> tuple[str, float, float]:
+    """Turn a free-form LLM stance into (direction, conviction, signed_score).
+
+    signed_score is direction_sign * conviction in [-1, 1], the numeric form the
+    decision layer folds into the catalyst score.
+    """
+    direction = "neutral"
+    conviction = 0.0
+    if isinstance(stance, dict):
+        raw_direction = str(stance.get("direction", "neutral")).strip().lower()
+        if raw_direction in {"bullish", "bearish", "neutral"}:
+            direction = raw_direction
+        try:
+            conviction = clamp(float(stance.get("conviction", 0.0)), 0.0, 1.0)
+        except (TypeError, ValueError):
+            conviction = 0.0
+    sign = {"bullish": 1.0, "bearish": -1.0}.get(direction, 0.0)
+    return direction, conviction, clamp(sign * conviction, -1.0, 1.0)
 
 
 def _enrich_item(item: dict[str, Any]) -> dict[str, Any]:

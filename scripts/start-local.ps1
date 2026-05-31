@@ -18,6 +18,22 @@ function Write-Step {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function Write-Detail {
+    param([string]$Message)
+    Write-Host "    $Message" -ForegroundColor DarkGray
+}
+
+function Show-ServiceLogs {
+    param(
+        [string]$StandardErrorPath,
+        [string]$StandardOutputPath
+    )
+    Write-Host "---- stderr: $StandardErrorPath" -ForegroundColor Yellow
+    Get-Content -LiteralPath $StandardErrorPath -Tail 80 -ErrorAction SilentlyContinue
+    Write-Host "---- stdout: $StandardOutputPath" -ForegroundColor Yellow
+    Get-Content -LiteralPath $StandardOutputPath -Tail 80 -ErrorAction SilentlyContinue
+}
+
 function Test-Http {
     param(
         [string]$Url,
@@ -51,8 +67,10 @@ function Ensure-StockPredictor {
     $python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if ((Test-Path -LiteralPath $python) -or $SkipInstall) {
         if (Test-Path -LiteralPath $python) {
+            Write-Detail "Python: $python"
             return $python
         }
+        Write-Detail "Python: python from PATH (-SkipInstall)"
         return "python"
     }
 
@@ -60,6 +78,7 @@ function Ensure-StockPredictor {
     python -m venv .venv
     & $python -m pip install -U pip
     & $python -m pip install -e ".[dev]"
+    Write-Detail "Python: $python"
     return $python
 }
 
@@ -73,6 +92,7 @@ function Ensure-Config {
         Write-Step "Creating local config at $ConfigPath"
         Copy-Item -LiteralPath $example -Destination $resolved
     }
+    Write-Detail "Config: $resolved"
 }
 
 function Stop-MatchingProcesses {
@@ -122,17 +142,25 @@ function Start-ServiceIfNeeded {
     foreach ($key in $Environment.Keys) {
         Set-Item -Path "Env:$key" -Value ([string]$Environment[$key])
     }
+    Write-Detail "Working directory: $WorkingDirectory"
+    Write-Detail "Health check: $HealthUrl"
+    Write-Detail "stdout log: $out"
+    Write-Detail "stderr log: $err"
     $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
     $process.Id | Set-Content -Path ".logs\$Name.pid"
+    Write-Detail "Started pid=$($process.Id); waiting up to $WaitSeconds seconds"
 
     if (-not (Wait-Http $HealthUrl $WaitSeconds)) {
-        Write-Host "$Name did not become ready. Last stderr lines:" -ForegroundColor Yellow
-        Get-Content $err -Tail 80 -ErrorAction SilentlyContinue
+        Write-Host "$Name did not become ready at $HealthUrl." -ForegroundColor Red
+        Show-ServiceLogs -StandardErrorPath $err -StandardOutputPath $out
         throw "$Name failed readiness check at $HealthUrl"
     }
-    Write-Host "$Name ready at $HealthUrl" -ForegroundColor Green
+    Write-Host "$Name ready at $HealthUrl (pid=$($process.Id))" -ForegroundColor Green
 }
 
+Write-Host ""
+Write-Host "StockPredictor local launcher" -ForegroundColor Green
+Write-Detail "Project: $ProjectRoot"
 Ensure-Config
 $python = Ensure-StockPredictor
 $logs = Join-Path $ProjectRoot ".logs"
@@ -196,5 +224,9 @@ Write-Host ""
 Write-Host "Stop later with: .\scripts\stop-local.ps1"
 
 if (-not $NoBrowser) {
+    Write-Host "Opening dashboard in your browser: http://127.0.0.1:$DashboardPort" -ForegroundColor Cyan
     Start-Process "http://127.0.0.1:$DashboardPort"
+}
+else {
+    Write-Detail "Browser launch skipped (-NoBrowser)."
 }

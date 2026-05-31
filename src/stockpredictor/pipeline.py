@@ -13,6 +13,7 @@ from .data import MarketDataProvider, build_snapshot, fetch_intraday_data, fetch
 from .features import build_feature_set, build_intraday_features, intraday_technical_score
 from .market import build_market_state, build_sector_context
 from .models import run_models
+from .news import analyze_symbol_news
 from .risk import apply_risk_controls
 from .session import build_session_context
 from .signals import fuse_signals
@@ -34,6 +35,7 @@ def analyze_symbol(
     include_market_context: bool = True,
     include_session: bool = True,
     include_snapshot: bool = True,
+    news_limit: int | None = None,
 ) -> AnalysisResult:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
@@ -68,7 +70,17 @@ def analyze_symbol(
         calendar_context = build_calendar_context(symbol, settings)
 
     predictions = run_models(symbol, frame, settings, model_names=model_names, horizon=horizon_name)
-    context = build_context_summary(symbol, settings, include_live_sources=include_context)
+    # Deep-dive (live) requests fold the rich news analysis into the decision so the
+    # trade plan both uses and shows the gathered news. Scans and backtests skip this
+    # to stay fast and avoid per-symbol LLM calls.
+    news_analysis = None
+    if include_context and data_frame is None and _news_in_decision_enabled(settings):
+        try:
+            news_analysis = analyze_symbol_news(symbol, settings, limit=news_limit)
+        except Exception as exc:  # never let a news outage break the analysis
+            LOGGER.info("News analysis unavailable for %s: %s", symbol, exc)
+            news_analysis = None
+    context = build_context_summary(symbol, settings, include_live_sources=include_context, news_analysis=news_analysis)
     decision = fuse_signals(
         symbol,
         features,
@@ -222,6 +234,11 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
         "setup_quality": risk_plan.setup_quality,
         "skip_reasons": "; ".join(risk_plan.no_trade_reasons),
     }
+
+
+def _news_in_decision_enabled(settings: Settings) -> bool:
+    news_cfg = settings.context_agent.get("news_analysis", {})
+    return bool(news_cfg.get("enabled", False)) and bool(news_cfg.get("use_in_decision", True))
 
 
 def _pct_distance(price: float, level: object) -> float | None:
