@@ -128,6 +128,33 @@ Both conservative; setting `use_in_decision: false` restores today's behavior.
   confirm the white box shows the summary + attribution; confirm the scanner still
   returns promptly.
 
+## Increment 2 — Make the LLM Read Move The Decision, Visibly
+
+Follow-up addressing four trader-UX/correctness gaps:
+
+1. **LLM stance merges into the score.** The summarizer now also returns
+   `stance {direction, conviction}`; `news._normalize_stance` turns it into a
+   signed `stance_score`, and `context._llm_stance_score` blends it into the
+   catalyst score (weight `news_analysis.llm_stance_weight`, default 0.6) — only
+   for real LLM providers, so heuristic stances aren't double-counted. The LLM's
+   positivity now actually moves `context.score`/`sentiment`, and the attribution
+   table shows it.
+2. **Verdict banner + "Why this isn't actionable".** A one-line color-coded
+   verdict (action · score · confidence · news impact) plus a diagnostic that names
+   the exact binding gate (dead-zone, confidence, liquidity, volatility,
+   risk/reward, hard block) and what would flip it.
+3. **Headline-count actuator.** A Trade Plan slider (`news_limit`) threads through
+   `analyze_symbol → analyze_symbol_news`; an explicit value overrides the config
+   cap, so a trader can pull >50 headlines.
+4. **No-trade recalibration (config-driven).** Confidence weighting is now tunable
+   (`confidence_score_weight`, `confidence_component_weight`,
+   `disagreement_confidence_penalty`); example defaults are gentler (0.60/0.50) and
+   `risk.min_confidence_for_trade` lowered 0.45→0.40, `min_confidence` 0.35→0.30.
+   Evidence (synthetic): this lets a strong setup clear the confidence gate
+   (score +0.42 → conf 0.62) and pushes borderline names to `watch`, but the
+   dominant block for weak names remains the **score dead-zone** and **risk/reward**
+   — which the new diagnostic now makes explicit rather than mysterious.
+
 ## Reporting Back (per CLAUDE.md)
 On completion: what changed, what was verified (tests + manual dashboard run), what
 was not verified (e.g. real LLM endpoint availability), remaining risk, and any

@@ -193,6 +193,45 @@ def test_context_consumes_news_analysis_evidence(tmp_path: Path) -> None:
     assert context.score > 0
 
 
+def test_llm_stance_blends_into_context_score(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    summary = {
+        "symbol": "TEST",
+        "stance": {"direction": "bullish", "conviction": 0.8},
+        "stance_score": 0.8,
+        "day_trader_focus": {},
+    }
+    neutral_headlines = [
+        {"symbol": "TEST", "title": "TEST mixed update", "url": "https://example.com/1", "impact": 0.0, "sentiment": "neutral", "freshness": 0.5}
+    ]
+    heuristic_news = {"symbol": "TEST", "summary": {**summary, "analysis_provider": "heuristic"}, "headlines": neutral_headlines}
+    llm_news = {"symbol": "TEST", "summary": {**summary, "analysis_provider": "localdeploy"}, "headlines": neutral_headlines}
+
+    heuristic_ctx = build_context_summary("TEST", settings, news_analysis=heuristic_news)
+    llm_ctx = build_context_summary("TEST", settings, news_analysis=llm_news)
+
+    # The LLM stance lifts the catalyst/context score; the heuristic stance does not.
+    assert llm_ctx.score > heuristic_ctx.score
+    assert llm_ctx.features["news_stance_score"] == pytest.approx(0.8)
+    assert heuristic_ctx.features["news_stance_score"] == 0.0
+
+
+def test_confidence_weights_are_config_driven(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["signal_fusion"]["thresholds"]["confidence_score_weight"] = 0.0
+    raw["signal_fusion"]["thresholds"]["confidence_component_weight"] = 1.0
+    raw["signal_fusion"]["thresholds"]["disagreement_confidence_penalty"] = 0.0
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+
+    context = ContextSummary(symbol="TEST", enabled=True, score=0.5, sentiment="bullish")
+    decision = fuse_signals("TEST", _bullish_features(), [_bullish_prediction()], context, settings)
+
+    # confidence = abs(score)*0.0 + component_confidence(0.7)*1.0 - 0.0
+    assert decision.confidence == pytest.approx(0.7, abs=1e-9)
+
+
 def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path)
     frame = SyntheticProvider().fetch("TEST", "6mo", "1d")

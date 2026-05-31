@@ -63,6 +63,46 @@ def test_analyze_symbol_news_returns_summary_and_evidence(tmp_path: Path, monkey
     assert result["summary"]["day_trader_focus"]["catalyst"]
 
 
+def test_analyze_symbol_news_limit_overrides_config_cap(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)  # default max_headlines_per_symbol is 50
+    captured = {}
+
+    def fake_fetch(symbols, limit=50, **kwargs):
+        captured["limit"] = limit
+        return [
+            {"symbol": "TEST", "title": f"TEST headline {index}", "url": f"https://example.com/{index}", "impact": 0.0, "sentiment": "neutral"}
+            for index in range(limit)
+        ]
+
+    monkeypatch.setattr("stockpredictor.news.fetch_news_items", fake_fetch)
+
+    result = analyze_symbol_news("TEST", settings, limit=120)
+
+    assert captured["limit"] == 120  # explicit actuator value, above the config cap of 50
+    assert len(result["headlines"]) == 120
+
+
+def test_normalize_llm_summary_extracts_stance() -> None:
+    bullish = _normalize_llm_summary(
+        {"grand_summary": "x", "stance": {"direction": "bullish", "conviction": 0.8}, "day_trader_focus": {}},
+        "localdeploy",
+    )
+    bearish = _normalize_llm_summary(
+        {"grand_summary": "x", "stance": {"direction": "bearish", "conviction": 0.5}, "day_trader_focus": {}},
+        "localdeploy",
+    )
+    junk = _normalize_llm_summary(
+        {"grand_summary": "x", "stance": "not a dict", "day_trader_focus": {}},
+        "localdeploy",
+    )
+
+    assert bullish["stance"]["direction"] == "bullish"
+    assert bullish["stance_score"] == pytest.approx(0.8)
+    assert bearish["stance_score"] == pytest.approx(-0.5)
+    assert junk["stance"]["direction"] == "neutral"
+    assert junk["stance_score"] == 0.0
+
+
 def test_news_feed_uses_requested_limit_for_symbol_summary(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr(

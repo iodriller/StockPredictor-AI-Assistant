@@ -153,8 +153,17 @@ def main() -> None:
         horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
         default_horizon = settings.horizons.get("default", "swing")
         selected_horizon = _render_horizon_selector(col_horizon, horizon_options, str(default_horizon))
+        default_news_limit = int(settings.context_agent.get("news_analysis", {}).get("max_headlines_per_symbol", 50))
+        news_limit = st.slider(
+            "Headlines to analyze",
+            min_value=5,
+            max_value=200,
+            value=min(max(default_news_limit, 5), 200),
+            step=5,
+            help="How many headlines to gather and feed into this symbol's news analysis and the decision. Free providers may return fewer.",
+        )
         if st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon."):
-            _render_analysis(settings, selected_symbol, horizon=selected_horizon)
+            _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit)
     with news_tab:
         _render_news(settings, symbols or settings.watchlist())
     with backtest_tab:
@@ -327,10 +336,10 @@ def _scanner_detail_label(row: dict) -> str:
     return f"{symbol} | {action} | rank {rank} | {reason}"
 
 
-def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
+def _render_analysis(settings, symbol: str, horizon: str | None = None, news_limit: int | None = None) -> None:
     progress = st.progress(0, text=f"Starting {symbol} analysis")
     progress.progress(0.15, text=f"Running signal, context, and risk checks for {symbol}")
-    result = analyze_symbol(symbol, settings, horizon=horizon)
+    result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit)
     progress.progress(0.75, text=f"Loading chart history for {symbol}")
     provider = get_market_data_provider(settings)
     frame = fetch_market_data(symbol, settings, provider)
@@ -351,6 +360,8 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
         _format_percent(result.snapshot.change_pct),
         help="Latest available price from intraday data when available; otherwise last daily close.",
     )
+
+    _render_verdict_banner(result)
 
     if session is not None and session.data_available:
         st.caption(
@@ -394,6 +405,8 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None) -> None:
             st.warning("Calendar flags: " + "; ".join(calendar.no_trade_flags))
 
     _render_trade_plan_summary(result)
+
+    _render_why_not_actionable(result, settings)
 
     _render_news_decision_panel(result)
 
@@ -493,6 +506,98 @@ def _render_trade_plan_summary(result) -> None:
         st.caption(_session_check_text(plan.session_checks))
 
 
+def _news_score_contribution(decision) -> float:
+    """Net amount the news-driven inputs (context + sentiment components and any news
+    penalty) moved the fused score. Used for the crisp one-line news-impact readout."""
+    total = 0.0
+    for row in decision.score_breakdown or []:
+        component = str(row.get("component", ""))
+        contribution = float(row.get("contribution", 0.0) or 0.0)
+        if row.get("kind") == "component" and component in {"context", "sentiment"}:
+            total += contribution
+        elif row.get("kind") == "penalty" and "news" in component.lower():
+            total += contribution
+    return total
+
+
+def _news_impact_phrase(result) -> str:
+    news = result.context.news_analysis or {}
+    if not news:
+        return ""
+    stance = news.get("stance", {}) if isinstance(news.get("stance"), dict) else {}
+    direction = str(stance.get("direction", "neutral"))
+    conviction = float(stance.get("conviction", 0.0) or 0.0)
+    contribution = _news_score_contribution(result.decision)
+    return f"News: {direction} (conviction {conviction:.0%}) → {contribution:+.3f} to score"
+
+
+def _render_verdict_banner(result) -> None:
+    """One-line, color-coded verdict so a trader can read the decision in two seconds."""
+    decision = result.decision
+    action = str(decision.action)
+    sentiment_word = "bullish" if decision.score > 0.05 else "bearish" if decision.score < -0.05 else "neutral"
+    verdict = action.upper().replace("_", " ")
+    parts = [
+        f"**{verdict}**",
+        f"score {decision.score:+.3f} ({sentiment_word})",
+        f"confidence {decision.confidence:.0%}",
+    ]
+    news_phrase = _news_impact_phrase(result)
+    if news_phrase:
+        parts.append(news_phrase)
+    message = "  ·  ".join(parts)
+    renderer = {"long": st.success, "short": st.error, "watch": st.info}.get(action, st.warning)
+    renderer(message)
+
+
+def _render_why_not_actionable(result, settings) -> None:
+    """Crisp, glanceable explanation of exactly which gate held the trade back, and
+    what would flip it — directly answering 'why is everything no_trade?'."""
+    decision = result.decision
+    plan = result.risk_plan
+    if decision.action in {"long", "short"} and plan.setup_quality == "actionable":
+        st.success("Actionable: signal strength, confidence, liquidity, volatility, and risk/reward gates all passed.")
+        return
+
+    thresholds = settings.signal_fusion.get("thresholds", {})
+    risk_cfg = settings.risk
+    watch_score = float(thresholds.get("watch_score", 0.18))
+    long_score = float(thresholds.get("long_score", 0.35))
+    required_conf = max(float(thresholds.get("min_confidence", 0.30)), float(risk_cfg.get("min_confidence_for_trade", 0.40)))
+
+    blockers: list[str] = []
+    if result.calendar is not None and result.calendar.no_trade_flags:
+        blockers.extend(f"Hard block — {flag}." for flag in result.calendar.no_trade_flags)
+    if abs(decision.score) < watch_score:
+        blockers.append(
+            f"Signal too weak — score {decision.score:+.3f} is inside the no-trade zone "
+            f"(needs ±{watch_score:.2f} to watch, ±{long_score:.2f} to trade)."
+        )
+    if decision.confidence < required_conf:
+        blockers.append(f"Confidence {decision.confidence:.0%} is below the required {required_conf:.0%}.")
+    quality_messages = {
+        "low_liquidity": "Liquidity — average volume is below the configured minimum.",
+        "too_volatile": "Volatility — ATR% is above the configured maximum.",
+        "extended": "Extended — price is too far from VWAP for a clean entry.",
+        "poor_risk_reward": f"Risk/reward is below the configured minimum ({risk_cfg.get('min_risk_reward', '-')}).",
+        "invalid_position_size": "Risk sizing produced no valid position.",
+    }
+    if plan.setup_quality in quality_messages:
+        blockers.append(quality_messages[plan.setup_quality])
+    if not blockers:
+        blockers = list(plan.no_trade_reasons) or ["Setup is not actionable under configured thresholds."]
+
+    st.warning("**Why this isn't actionable**\n\n" + "\n".join(f"- {item}" for item in blockers))
+
+    hints: list[str] = []
+    if abs(decision.score) < watch_score:
+        hints.append("models, technicals, and news agreeing on a clearer direction")
+    if decision.confidence < required_conf:
+        hints.append("higher conviction across components")
+    if hints:
+        st.caption("Would become actionable with: " + "; ".join(hints) + ".")
+
+
 def _render_news_decision_panel(result) -> None:
     """White-box view: shows whether news was gathered and exactly how it moved the
     fused score, tying the News-tab style summary directly to the trade decision."""
@@ -523,6 +628,10 @@ def _render_news_decision_panel(result) -> None:
     grand_summary = str(news.get("grand_summary", "")).strip()
     if grand_summary:
         st.write(grand_summary)
+
+    impact_phrase = _news_impact_phrase(result)
+    if impact_phrase:
+        st.caption(f"{impact_phrase}. Stance is an evidence summary from {provider}, blended into the catalyst score — not advice.")
 
     focus = news.get("day_trader_focus", {}) if isinstance(news.get("day_trader_focus"), dict) else {}
     if focus:
