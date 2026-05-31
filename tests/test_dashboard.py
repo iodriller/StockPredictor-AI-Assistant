@@ -14,7 +14,17 @@ def test_dashboard_initial_render_has_no_runtime_exception() -> None:
     app = AppTest.from_file(str(dashboard), default_timeout=30).run()
 
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"]
+    assert not app.tabs
+    assert len(app.segmented_control) == 1
+    assert app.segmented_control[0].options == ["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"]
+    assert app.segmented_control[0].value == "Scanner"
+    assert [button.label for button in app.button] == ["Scan Selected Symbols", "Clear selected symbols"]
+
+    app.segmented_control[0].set_value("News").run()
+
+    assert not app.exception
+    assert "Get News" in [button.label for button in app.button]
+    assert "Scan Selected Symbols" not in [button.label for button in app.button]
 
 
 def test_price_chart_uses_configured_ma_windows_and_result_levels() -> None:

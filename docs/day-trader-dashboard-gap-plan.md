@@ -31,12 +31,17 @@ workflow sources. It is research and product planning, not financial advice.
 
 - Search and discovery was watchlist-bound. The dashboard needs symbol lookup,
   arbitrary ticker entry, and eventually true market-wide scans.
+- Symbol lookup now merges SEC company tickers with Nasdaq Trader listed and
+  other-listed files, adding broad ETF and exchange-security coverage. A paid
+  security master is still needed for exhaustive multi-asset coverage.
 - Scanner now has trader-facing ranking and filters. True market-wide and
   tick-level intraday filters still need a dedicated intraday data provider for
   premarket, spread, float, halt, and high-of-day momentum coverage.
 - News is now a first-class workflow with per-symbol summaries, source links,
   sentiment, impact, category, local LLM support, and optional article excerpts
   passed into the summarizer.
+- Headline classification now supports a configured LLM classifier with visible
+  per-row provenance and explicit keyword fallback.
 - Charts now show candles, volume, VWAP/moving averages, session/prior levels,
   opening-range availability, and risk-plan overlays for entry, stop, targets,
   and entry zone.
@@ -55,6 +60,9 @@ workflow sources. It is research and product planning, not financial advice.
 - Backtesting now records stop/target/time exits, slippage/commission, R
   multiple, MAE/MFE, setup quality, top reason, and no-trade logs. True intraday
   strategy testing still needs intraday bars.
+- Dashboard workspaces now render one at a time, expensive results persist in a
+  local ignored cache across restarts, and scan/news network work uses bounded
+  workers.
 
 ## Priority Build Plan
 
@@ -62,8 +70,9 @@ workflow sources. It is research and product planning, not financial advice.
    - Add all-stock symbol search by ticker/company name.
    - Add arbitrary comma-separated tickers for scan/backtest.
    - Add API endpoint for symbol lookup.
-   - Status: implemented with SEC-backed symbol search, local fallback, direct
-     ticker entry, and one selected-symbol workflow in the sidebar.
+   - Status: implemented with SEC and Nasdaq Trader symbol indexes, local
+     fallback, direct ticker entry, and one selected-symbol workflow in the
+     sidebar.
 
 2. **News feed tab**
    - Show recent headlines for selected symbols.

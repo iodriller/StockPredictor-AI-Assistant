@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -219,18 +220,27 @@ def fetch_news_items(
     active_sources = _active_news_sources(sources)
     source_config = source_config or {}
     per_symbol_limit = max(1, math.ceil(limit / max(len(symbols), 1)))
+    tasks = [(symbol, source) for symbol in symbols for source in active_sources]
+    workers = max(1, min(int(source_config.get("fetch_workers", 6)), len(tasks) or 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="news-source") as executor:
+        fetched = list(executor.map(lambda task: _fetch_news_source(task[0], task[1], per_symbol_limit, source_config), tasks))
+    by_symbol_source = {(symbol, source): batch for (symbol, source), batch in zip(tasks, fetched)}
     items: list[dict[str, Any]] = []
     for symbol in symbols:
-        source_batches: list[list[dict[str, Any]]] = []
-        if "yfinance_news" in active_sources:
-            source_batches.append(_yfinance_news(symbol, limit=per_symbol_limit))
-        if "yahoo_search_news" in active_sources:
-            source_batches.append(_yahoo_search_news(symbol, limit=per_symbol_limit))
-        if "google_news_rss" in active_sources:
-            source_batches.append(_google_news_rss(symbol, limit=per_symbol_limit, source_config=source_config.get("google_news_rss", {})))
+        source_batches = [by_symbol_source[(symbol, source)] for source in active_sources]
         symbol_items = _interleave_news_batches(source_batches)
         items.extend(_dedupe_news_items(symbol_items)[:per_symbol_limit])
     return items[:limit]
+
+
+def _fetch_news_source(symbol: str, source: str, limit: int, source_config: dict[str, Any]) -> list[dict[str, Any]]:
+    if source == "yfinance_news":
+        return _yfinance_news(symbol, limit=limit)
+    if source == "yahoo_search_news":
+        return _yahoo_search_news(symbol, limit=limit)
+    if source == "google_news_rss":
+        return _google_news_rss(symbol, limit=limit, source_config=source_config.get("google_news_rss", {}))
+    return []
 
 
 def _active_news_sources(sources: list[str] | None) -> list[str]:
@@ -396,7 +406,8 @@ def _dedupe_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     deduped = []
     for item in items:
-        key = (str(item.get("symbol") or ""), str(item.get("url") or item.get("title") or ""))
+        title = " ".join(str(item.get("title") or "").lower().split())
+        key = (str(item.get("symbol") or ""), title or str(item.get("url") or ""))
         if key in seen:
             continue
         seen.add(key)

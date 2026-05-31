@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from html import unescape
 from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import math
@@ -53,22 +54,14 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50, pro
     # actionable headline and the limited scrape budget is spent on useful rows.
     enriched = _sort_news_items(enriched)
     enriched = _attach_article_excerpts(enriched, cfg, progress_callback)
+    enriched = _classify_headlines(enriched, cfg, progress_callback)
+    enriched = _sort_news_items(enriched)
     fresh_threshold = float(cfg.get("fresh_window_minutes", 60))
     fresh_catalyst_count = sum(
         1 for item in enriched if (item.get("age_minutes") is not None and float(item["age_minutes"]) <= fresh_threshold and abs(float(item.get("impact", 0.0))) >= 0.15)
     )
     grouped = {symbol: [item for item in enriched if item.get("symbol") == symbol] for symbol in clean_symbols}
-    summaries = []
-    total_symbols = max(len(grouped), 1)
-    for index, (symbol, items) in enumerate(grouped.items(), start=1):
-        _notify_progress(progress_callback, 0.78 + 0.15 * ((index - 1) / total_symbols), f"Summarizing {symbol}")
-        clipped = items[:summary_limit]
-        try:
-            summaries.append(_summarize_symbol_news(symbol, clipped, settings))
-        except NewsAnalysisError as exc:
-            if len(grouped) <= 1:
-                raise
-            summaries.append(_llm_error_symbol_summary(symbol, clipped, str(exc)))
+    summaries = _summarize_grouped_news(grouped, settings, summary_limit, progress_callback)
     headlines = enriched[:requested_limit]
     _notify_progress(progress_callback, 0.95, "Finalizing news feed")
     return {
@@ -109,6 +102,8 @@ def analyze_symbol_news(symbol: str, settings: Settings, limit: int | None = Non
     enriched = [_enrich_item(item) for item in all_items if str(item.get("symbol", "")).upper() == symbol or not item.get("symbol")]
     enriched = _sort_news_items(enriched)
     enriched = _attach_article_excerpts(enriched, cfg)
+    enriched = _classify_headlines(enriched, cfg)
+    enriched = _sort_news_items(enriched)
 
     clipped = enriched[:summary_limit]
     try:
@@ -128,6 +123,29 @@ def _sort_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ),
         reverse=True,
     )
+
+
+def _summarize_grouped_news(
+    grouped: dict[str, list[dict[str, Any]]],
+    settings: Settings,
+    summary_limit: int,
+    progress_callback: ProgressCallback | None,
+) -> list[dict[str, Any]]:
+    pairs = [(symbol, items[:summary_limit]) for symbol, items in grouped.items()]
+    workers = max(1, min(int(settings.context_agent.get("news_analysis", {}).get("summary_workers", 2)), len(pairs) or 1))
+    summaries: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="news-summary") as executor:
+        futures = {executor.submit(_summarize_symbol_news, symbol, items, settings): (symbol, items) for symbol, items in pairs}
+        for index, future in enumerate(as_completed(futures), start=1):
+            symbol, items = futures[future]
+            try:
+                summaries[symbol] = future.result()
+            except NewsAnalysisError as exc:
+                if len(grouped) <= 1:
+                    raise
+                summaries[symbol] = _llm_error_symbol_summary(symbol, items, str(exc))
+            _notify_progress(progress_callback, 0.78 + 0.15 * (index / max(len(pairs), 1)), f"Summarized {symbol} ({index}/{len(pairs)})")
+    return [summaries[symbol] for symbol, _ in pairs]
 
 
 def _summarize_symbol_news(symbol: str, items: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
@@ -268,11 +286,15 @@ def _news_llm_instructions() -> str:
 
 
 def _call_openai_responses(symbol: str, payload_items: list[dict[str, Any]], news_cfg: dict[str, Any], api_key: str) -> dict[str, Any]:
+    return _call_openai_responses_json({"symbol": symbol, "headlines": payload_items}, news_cfg, api_key, _news_llm_instructions())
+
+
+def _call_openai_responses_json(payload: dict[str, Any], news_cfg: dict[str, Any], api_key: str, instructions: str) -> dict[str, Any]:
     body = {
         "model": str(news_cfg.get("model", "gpt-5")),
-        "instructions": _news_llm_instructions(),
-        "input": json.dumps({"symbol": symbol, "headlines": payload_items}, ensure_ascii=False),
-        "max_output_tokens": 900,
+        "instructions": instructions,
+        "input": json.dumps(payload, ensure_ascii=False),
+        "max_output_tokens": int(news_cfg.get("max_output_tokens", 900)),
     }
     response = httpx.post(
         "https://api.openai.com/v1/responses",
@@ -285,14 +307,18 @@ def _call_openai_responses(symbol: str, payload_items: list[dict[str, Any]], new
 
 
 def _call_openai_compatible_chat(symbol: str, payload_items: list[dict[str, Any]], news_cfg: dict[str, Any]) -> dict[str, Any]:
+    return _call_openai_compatible_json({"symbol": symbol, "headlines": payload_items}, news_cfg, _news_llm_instructions())
+
+
+def _call_openai_compatible_json(payload: dict[str, Any], news_cfg: dict[str, Any], instructions: str) -> dict[str, Any]:
     base_url = os.environ.get("LOCALDEPLOY_BASE_URL") or str(news_cfg.get("base_url", "http://127.0.0.1:8100/v1/chat/completions"))
     model = os.environ.get("LOCALDEPLOY_NEWS_MODEL") or str(news_cfg.get("model", "qwen3vl_8b_ollama"))
     provider = str(news_cfg.get("provider", "")).lower()
     body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _news_llm_instructions()},
-            {"role": "user", "content": json.dumps({"symbol": symbol, "headlines": payload_items}, ensure_ascii=False)},
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         "temperature": float(news_cfg.get("temperature", 0.1)),
         "max_tokens": int(news_cfg.get("max_output_tokens", 700)),
@@ -373,7 +399,112 @@ def _enrich_item(item: dict[str, Any]) -> dict[str, Any]:
         "age_minutes": age_minutes,
         "freshness": freshness,
         "day_trader_relevance": _relevance_score(title, impact, category, freshness),
+        "classification_provider": "keyword",
     }
+
+
+def _classify_headlines(
+    items: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    classifier_cfg = cfg.get("headline_classifier", {})
+    if not classifier_cfg.get("enabled", False) or not items:
+        return items
+    output = [dict(item) for item in items]
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    max_per_symbol = max(1, int(classifier_cfg.get("max_headlines_per_symbol", 30)))
+    for index, item in enumerate(output):
+        symbol = str(item.get("symbol", "")).upper()
+        rows = grouped.setdefault(symbol, [])
+        if len(rows) < max_per_symbol:
+            rows.append((index, item))
+    workers = max(1, min(int(classifier_cfg.get("workers", 2)), len(grouped) or 1))
+    _notify_progress(progress_callback, 0.76, f"Running configured headline classifier for {len(grouped)} symbol(s)")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="headline-classifier") as executor:
+        futures = {
+            executor.submit(_llm_headline_classifications, symbol, [item for _, item in rows], classifier_cfg): (symbol, rows)
+            for symbol, rows in grouped.items()
+        }
+        for future in as_completed(futures):
+            symbol, rows = futures[future]
+            try:
+                classifications, provider = future.result()
+            except Exception as exc:
+                LOGGER.warning("Headline classifier failed for %s: %s", symbol, exc)
+                if not classifier_cfg.get("fallback_to_keyword", True):
+                    raise NewsAnalysisError(f"Headline classifier failed for {symbol} and keyword fallback is disabled: {exc}") from exc
+                continue
+            for local_index, classification in enumerate(classifications):
+                if local_index >= len(rows):
+                    break
+                output_index, item = rows[local_index]
+                category = str(classification.get("category", item.get("category", "other"))).lower()
+                sentiment = str(classification.get("sentiment", item.get("sentiment", "neutral"))).lower()
+                if category not in {*CATEGORY_KEYWORDS, "other"}:
+                    category = str(item.get("category", "other"))
+                if sentiment not in {"bullish", "bearish", "neutral"}:
+                    sentiment = str(item.get("sentiment", "neutral"))
+                impact = _bounded_float(classification.get("impact"), float(item.get("impact", 0.0)))
+                output[output_index] = {
+                    **item,
+                    "category": category,
+                    "sentiment": sentiment,
+                    "impact": impact,
+                    "day_trader_relevance": _relevance_score(str(item.get("title", "")), impact, category, float(item.get("freshness", 0.0))),
+                    "classification_provider": provider,
+                }
+    return output
+
+
+def _llm_headline_classifications(
+    symbol: str,
+    items: list[dict[str, Any]],
+    classifier_cfg: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    payload = {
+        "symbol": symbol,
+        "headlines": [
+            {
+                "index": index,
+                "title": item.get("title", ""),
+                "published": item.get("published", ""),
+                "article_excerpt": item.get("article_excerpt", ""),
+            }
+            for index, item in enumerate(items)
+        ],
+    }
+    provider = str(classifier_cfg.get("provider", "localdeploy")).lower()
+    instructions = (
+        "Return only valid JSON with a headlines array in the same order. "
+        "Each item must contain index, category, sentiment, and impact. "
+        f"category must be one of: {', '.join([*CATEGORY_KEYWORDS, 'other'])}. "
+        "sentiment must be bullish, bearish, or neutral. impact must be from -1 to 1. "
+        "Classify only from the supplied headline and excerpt."
+    )
+    if provider == "openai":
+        api_key = os.environ.get(str(classifier_cfg.get("api_key_env", "OPENAI_API_KEY")))
+        if not api_key:
+            raise RuntimeError(f"{classifier_cfg.get('api_key_env', 'OPENAI_API_KEY')} is not set")
+        parsed = _call_openai_responses_json(payload, classifier_cfg, api_key, instructions)
+        provider_label = "openai"
+    elif provider in {"localdeploy", "openai_compatible", "local_openai"}:
+        parsed = _call_openai_compatible_json(payload, classifier_cfg, instructions)
+        provider_label = "localdeploy" if provider == "localdeploy" else "openai_compatible"
+    else:
+        raise RuntimeError(f"Unsupported headline classifier provider: {provider}")
+    rows = parsed.get("headlines", [])
+    if not isinstance(rows, list):
+        raise RuntimeError("Headline classifier response must contain a headlines list")
+    by_index = {int(row["index"]): row for row in rows if isinstance(row, dict) and str(row.get("index", "")).isdigit()}
+    return [by_index.get(index, {}) for index in range(len(items))], provider_label
+
+
+def _bounded_float(value: object, default: float) -> float:
+    try:
+        return clamp(float(value), -1.0, 1.0)
+    except (TypeError, ValueError):
+        return default
 
 
 def _attach_article_excerpts(items: list[dict[str, Any]], cfg: dict[str, Any], progress_callback: ProgressCallback | None = None) -> list[dict[str, Any]]:
@@ -385,30 +516,36 @@ def _attach_article_excerpts(items: list[dict[str, Any]], cfg: dict[str, Any], p
     max_chars = int(scrape_cfg.get("max_chars_per_article", 1400))
     user_agent = str(scrape_cfg.get("user_agent", "StockPredictor research crawler/0.1"))
     attempts: dict[str, int] = {}
-    output = []
-    candidates = [item for item in items if item.get("url")]
-    _notify_progress(progress_callback, 0.60, f"Fetching up to {max_articles_per_symbol} article page(s) per symbol")
+    output = [dict(item) for item in items]
+    candidates: list[tuple[int, str]] = []
     for index, item in enumerate(items):
-        enriched_item = dict(item)
         symbol = str(item.get("symbol", "")).upper()
         url = str(item.get("url", "") or "")
         if url and attempts.get(symbol, 0) < max_articles_per_symbol:
             attempts[symbol] = attempts.get(symbol, 0) + 1
+            candidates.append((index, url))
+    _notify_progress(progress_callback, 0.60, f"Fetching up to {max_articles_per_symbol} article page(s) per symbol")
+    workers = max(1, min(int(scrape_cfg.get("workers", 6)), len(candidates) or 1))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="article-excerpt") as executor:
+        futures = {
+            executor.submit(_fetch_article_excerpt, url, timeout_seconds=timeout_seconds, max_chars=max_chars, user_agent=user_agent): (index, url)
+            for index, url in candidates
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            index, url = futures[future]
             try:
-                excerpt = _fetch_article_excerpt(url, timeout_seconds=timeout_seconds, max_chars=max_chars, user_agent=user_agent)
+                excerpt = future.result()
                 if excerpt:
-                    enriched_item["article_excerpt"] = excerpt
-                    enriched_item["article_fetched"] = True
+                    output[index]["article_excerpt"] = excerpt
+                    output[index]["article_fetched"] = True
                 else:
-                    enriched_item["article_fetched"] = False
-                    enriched_item["article_error"] = "no extractable article text"
+                    output[index]["article_fetched"] = False
+                    output[index]["article_error"] = "no extractable article text"
             except Exception as exc:
                 LOGGER.info("Article excerpt fetch failed for %s: %s", url, exc)
-                enriched_item["article_fetched"] = False
-                enriched_item["article_error"] = str(exc)
-        output.append(enriched_item)
-        if candidates:
-            _notify_progress(progress_callback, 0.60 + 0.15 * ((index + 1) / max(len(items), 1)), "Fetching article excerpts")
+                output[index]["article_fetched"] = False
+                output[index]["article_error"] = str(exc)
+            _notify_progress(progress_callback, 0.60 + 0.15 * (completed / max(len(candidates), 1)), "Fetching article excerpts")
     return output
 
 
@@ -581,6 +718,7 @@ def _coverage_metadata(settings: Settings, items: list[dict[str, Any]] | None = 
     llm_cfg = settings.context_agent.get("news_analysis", {}).get("llm", {})
     news_cfg = settings.context_agent.get("news_analysis", {})
     scrape_cfg = news_cfg.get("article_scraping", {})
+    classifier_cfg = news_cfg.get("headline_classifier", {})
     configured_sources = [str(source) for source in settings.context_agent.get("sources", [])]
     headline_sources = headline_sources or _configured_headline_sources(settings)
     items = items or []
@@ -600,6 +738,9 @@ def _coverage_metadata(settings: Settings, items: list[dict[str, Any]] | None = 
         "provider_counts": provider_counts,
         "llm_enabled": bool(llm_cfg.get("enabled", False)),
         "llm_provider": str(llm_cfg.get("provider", "heuristic")),
+        "headline_classifier_enabled": bool(classifier_cfg.get("enabled", False)),
+        "headline_classifier_provider": str(classifier_cfg.get("provider", "keyword")) if classifier_cfg.get("enabled", False) else "keyword",
+        "classification_providers": sorted({str(item.get("classification_provider", "keyword")) for item in items}),
         "fallback_to_heuristic": bool(llm_cfg.get("fallback_to_heuristic", True)),
         "article_body_scraping": bool(scrape_cfg.get("enabled", False)),
         "article_excerpt_count": article_excerpt_count,

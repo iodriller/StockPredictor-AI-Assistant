@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 import pandas as pd
@@ -76,12 +77,25 @@ def analyze_symbol(
     # trade plan both uses and shows the gathered news. Scans and backtests skip this
     # to stay fast and avoid per-symbol LLM calls.
     news_analysis = None
+    news_enrichment = {"status": "skipped", "reason": "Rich news analysis was not requested for this run."}
     if include_context and include_news_analysis and data_frame is None and _news_in_decision_enabled(settings):
         try:
             news_analysis = analyze_symbol_news(symbol, settings, limit=news_limit)
+            summary = news_analysis.get("summary", {})
+            analysis_provider = str(summary.get("analysis_provider", "unknown"))
+            news_enrichment = {
+                "status": "degraded" if analysis_provider in {"heuristic_fallback", "llm_error"} else "available",
+                "analysis_provider": analysis_provider,
+                "headline_count": len(news_analysis.get("headlines", [])),
+            }
+            if summary.get("llm_error"):
+                news_enrichment["error"] = str(summary["llm_error"])
         except Exception as exc:  # never let a news outage break the analysis
             LOGGER.info("News analysis unavailable for %s: %s", symbol, exc)
             news_analysis = None
+            news_enrichment = {"status": "unavailable", "error": str(exc)}
+    elif not _news_in_decision_enabled(settings):
+        news_enrichment = {"status": "disabled", "reason": "Rich news-in-decision analysis is disabled by configuration."}
     context = build_context_summary(symbol, settings, include_live_sources=include_context, news_analysis=news_analysis)
     decision = fuse_signals(
         symbol,
@@ -121,6 +135,7 @@ def analyze_symbol(
         market_state=market_state,
         sector_context=sector_context,
         calendar=calendar_context,
+        news_enrichment=news_enrichment,
         previous_snapshots=previous,
     )
     if include_snapshot and data_frame is None:
@@ -142,10 +157,22 @@ def scan_symbols(
     selected_symbols = symbols[:max_symbols] if max_symbols is not None else symbols
     results = []
     total = max(len(selected_symbols), 1)
-    for index, symbol in enumerate(selected_symbols, start=1):
-        if progress_callback is not None:
-            progress_callback((index - 1) / total, f"Analyzing {symbol} ({index}/{total})")
-        results.append(analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon, include_news_analysis=False))
+    workers = max(1, min(int(settings.raw.get("scanner", {}).get("workers", 4)), total))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scanner") as executor:
+        futures = {
+            executor.submit(analyze_symbol, symbol, settings=settings, provider=provider, horizon=horizon, include_news_analysis=False): symbol
+            for symbol in selected_symbols
+        }
+        for index, future in enumerate(as_completed(futures), start=1):
+            symbol = futures[future]
+            try:
+                results.append(future.result())
+                message = f"Analyzed {symbol} ({index}/{total})"
+            except Exception as exc:
+                LOGGER.warning("Scanner analysis failed for %s: %s", symbol, exc)
+                message = f"Skipped {symbol}: analysis failed ({index}/{total})"
+            if progress_callback is not None:
+                progress_callback(index / total, message)
     if progress_callback is not None:
         progress_callback(1.0, f"Scanner finished for {len(results)} symbol(s)")
     action_rank = {"long": 0, "short": 0, "watch": 1, "low_confidence": 2, "no_trade": 3}

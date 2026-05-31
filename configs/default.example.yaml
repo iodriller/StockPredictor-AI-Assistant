@@ -107,6 +107,7 @@ risk:
   pdt_min_equity: 25000
 
 scanner:
+  workers: 4
   default_filters:
     min_abs_change_pct: 0.0
     min_volume_anomaly: 0.0
@@ -135,6 +136,8 @@ context_agent:
     use_in_decision: true   # fold the per-symbol news summary into the trade decision (deep-dive only); false restores news-as-display-only
     llm_stance_weight: 0.6  # how much the LLM's net stance (direction x conviction) overrides the keyword catalyst score in the decision
     max_headlines_per_symbol: 50
+    fetch_workers: 6
+    summary_workers: 2
     source_count_clickthrough: true
     google_news_rss:
       query_template: "{symbol} stock"
@@ -162,9 +165,21 @@ context_agent:
       max_output_tokens: 700
       temperature: 0.1
       fallback_to_heuristic: false
+    headline_classifier:
+      enabled: true
+      provider: localdeploy
+      model: qwen3vl_8b_ollama
+      base_url: http://127.0.0.1:8100/v1/chat/completions
+      timeout_seconds: 120
+      max_output_tokens: 1200
+      temperature: 0.1
+      max_headlines_per_symbol: 30
+      workers: 2
+      fallback_to_keyword: true
     article_scraping:
       enabled: true
       max_articles_per_symbol: 3
+      workers: 6
       timeout_seconds: 8
       max_chars_per_article: 1400
       user_agent: StockPredictor research crawler/0.1
@@ -184,6 +199,10 @@ dashboard:
   default_symbol: AAPL
   default_watchlist: default
   max_scan_symbols: 10
+  result_cache:
+    enabled: true
+    path: data/dashboard_state.local.pkl
+    max_age_minutes: 240
 
 horizons:
   default: swing

@@ -12,6 +12,7 @@ venv/
 configs/default.yaml
 data/*.jsonl
 data/*.local.json
+data/*.local.pkl
 *.log
 dist/
 build/

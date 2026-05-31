@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from collections.abc import Iterable
+from threading import RLock
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -54,28 +55,30 @@ def clean_symbol_list(symbols: Iterable[str]) -> list[str]:
 
 
 class TTLCache:
-    """Tiny TTL cache for in-process use. Not thread-safe; fine for the dashboard/API single-process model."""
-
     def __init__(self, ttl_seconds: float) -> None:
         self.ttl_seconds = float(ttl_seconds)
         self._store: dict[Any, tuple[float, Any]] = {}
+        self._lock = RLock()
 
     def get(self, key: Any) -> Any | None:
-        record = self._store.get(key)
-        if record is None:
-            return None
-        expires_at, value = record
-        if expires_at < datetime.now(timezone.utc).timestamp():
-            self._store.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            record = self._store.get(key)
+            if record is None:
+                return None
+            expires_at, value = record
+            if expires_at < datetime.now(timezone.utc).timestamp():
+                self._store.pop(key, None)
+                return None
+            return value
 
     def set(self, key: Any, value: Any) -> None:
         expires_at = datetime.now(timezone.utc).timestamp() + self.ttl_seconds
-        self._store[key] = (expires_at, value)
+        with self._lock:
+            self._store[key] = (expires_at, value)
 
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
 
 def to_serializable(value: Any) -> Any:

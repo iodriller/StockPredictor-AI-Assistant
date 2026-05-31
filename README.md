@@ -130,6 +130,12 @@ The default data provider is `yfinance`. If market data fails and
 `allow_synthetic_fallback` is enabled, the app uses deterministic synthetic data
 so the local UI and tests can still run.
 
+Symbol lookup merges SEC company tickers with the official Nasdaq Trader listed
+and other-listed symbol files, then caches the result locally for 24 hours. This
+adds broad exchange-security and ETF discovery without requiring an API key.
+It is not a paid security master and does not guarantee every mutual fund,
+option, future, or OTC instrument.
+
 Day-trader overlays such as premarket high/low, spreads, halt status, float, and
 true time-of-day relative volume require an intraday/scanner data provider. The
 default free provider exposes enough data for local research, but not every
@@ -196,6 +202,20 @@ is enabled, the UI labels the result as `heuristic_fallback`.
 Optional article excerpt fetching is configured under
 `context_agent.news_analysis.article_scraping`. The app fetches short article
 excerpts for summarization; it does not store full article bodies.
+
+Headline rows can use a separate configured LLM classifier under
+`context_agent.news_analysis.headline_classifier`. Each row shows its actual
+classifier provenance. When `fallback_to_keyword` is enabled, a failed LLM
+classification falls back visibly to `keyword` instead of hiding the degraded
+path.
+
+News source fetches, article excerpts, per-symbol summaries, and scanner symbols
+use bounded worker pools configured by `fetch_workers`, `workers`,
+`summary_workers`, and `scanner.workers`.
+
+Dashboard scan, trade-plan, news, and backtest results are cached locally in
+`data/dashboard_state.local.pkl` by default. The file is ignored by Git. Change
+or disable this under `dashboard.result_cache`.
 
 Trader Agent
 ------------

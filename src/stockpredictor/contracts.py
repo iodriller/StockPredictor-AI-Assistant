@@ -228,5 +228,6 @@ class AnalysisResult:
     market_state: MarketState | None = None
     sector_context: SectorContext | None = None
     calendar: CalendarContext | None = None
+    news_enrichment: dict[str, Any] = field(default_factory=dict)
     snapshot_record: AnalysisSnapshot | None = None
     previous_snapshots: list[AnalysisSnapshot] = field(default_factory=list)

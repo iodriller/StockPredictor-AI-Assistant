@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import threading
+import time
 
 import pandas as pd
 import pytest
@@ -525,6 +527,48 @@ def test_scan_symbols_skips_expensive_news_analysis(tmp_path: Path, monkeypatch)
 
     assert calls
     assert all(call["include_news_analysis"] is False for call in calls)
+
+
+def test_scan_symbols_uses_bounded_workers(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["scanner"]["workers"] = 2
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class Result:
+        def __init__(self, symbol: str) -> None:
+            self.decision = SignalDecision(symbol=symbol, action="low_confidence", confidence=0.1, score=0.0, timeframe="1d")
+            self.scanner_row = {"rank_score": 0.0}
+
+    def fake_analyze(symbol, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return Result(symbol)
+
+    monkeypatch.setattr("stockpredictor.pipeline.analyze_symbol", fake_analyze)
+
+    scan_symbols(settings, symbols=["AAA", "BBB", "CCC"])
+
+    assert max_active == 2
+
+
+def test_analysis_surfaces_rich_news_outage(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    monkeypatch.setattr("stockpredictor.pipeline.analyze_symbol_news", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("LocalDeploy offline")))
+
+    result = analyze_symbol("TEST", settings, provider=SyntheticProvider())
+
+    assert result.news_enrichment["status"] == "unavailable"
+    assert "LocalDeploy offline" in result.news_enrichment["error"]
 
 
 def test_fallback_provider_logs_primary_failure(caplog) -> None:

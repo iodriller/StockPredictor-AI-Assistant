@@ -12,6 +12,7 @@ import streamlit as st
 from stockpredictor.backtesting import run_backtest
 from stockpredictor.config import ConfigError, load_settings
 from stockpredictor.data import fetch_market_data, get_market_data_provider
+from stockpredictor.dashboard_cache import CACHE_KEYS, load_dashboard_cache, save_dashboard_cache
 from stockpredictor.journal import (
     append_journal_entry,
     delete_journal_entry,
@@ -138,42 +139,65 @@ def main() -> None:
         return
 
     symbols = _render_symbol_sidebar(settings)
-
-    scan_tab, deep_dive_tab, news_tab, backtest_tab, journal_tab, config_tab = st.tabs(
-        ["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"]
-    )
-    with scan_tab:
+    _initialize_dashboard_cache(settings)
+    workspace = st.segmented_control(
+        "Workspace",
+        options=["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"],
+        default="Scanner",
+        key="dashboard_workspace",
+        help="Choose one workflow. Only the active workspace runs, which keeps interactions responsive.",
+    ) or "Scanner"
+    if workspace == "Scanner":
         _render_scanner(settings, symbols)
-    with deep_dive_tab:
-        default_symbol = symbols[0] if symbols else settings.dashboard.get("default_symbol", "AAPL")
-        col_sym, col_horizon = st.columns([2, 3])
-        selected_symbol = col_sym.text_input("Symbol", value=str(default_symbol), help="Ticker to analyze. Use the sidebar search if you do not know the symbol.").upper()
-        horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
-        default_horizon = settings.horizons.get("default", "swing")
-        selected_horizon = _render_horizon_selector(col_horizon, horizon_options, str(default_horizon))
-        default_news_limit = int(settings.context_agent.get("news_analysis", {}).get("max_headlines_per_symbol", 50))
-        news_limit = st.slider(
-            "Headlines to analyze",
-            min_value=5,
-            max_value=200,
-            value=min(max(default_news_limit, 5), 200),
-            step=5,
-            help="How many headlines to gather and feed into this symbol's news analysis and the decision. Free providers may return fewer.",
-        )
-        analyze_requested = st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon.")
-        if analyze_requested:
-            _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit, refresh=True)
-        elif st.session_state.get("latest_analysis") is not None:
-            _render_analysis(settings, selected_symbol, refresh=False)
-    with news_tab:
+    elif workspace == "Trade Plan":
+        _render_trade_plan_workspace(settings, symbols)
+    elif workspace == "News":
         _render_news(settings, symbols or settings.watchlist())
-    with backtest_tab:
+    elif workspace == "Backtest":
         _render_backtest(settings, symbols)
-    with journal_tab:
+    elif workspace == "Journal":
         _render_journal(settings, symbols)
-    with config_tab:
+    elif workspace == "Settings":
         _render_settings_tab(settings, symbols)
     _install_expander_memory()
+
+
+def _render_trade_plan_workspace(settings, symbols: list[str]) -> None:
+    default_symbol = symbols[0] if symbols else settings.dashboard.get("default_symbol", "AAPL")
+    col_sym, col_horizon = st.columns([2, 3])
+    selected_symbol = col_sym.text_input("Symbol", value=str(default_symbol), help="Ticker to analyze. Use the sidebar search if you do not know the symbol.").upper()
+    horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
+    default_horizon = settings.horizons.get("default", "swing")
+    selected_horizon = _render_horizon_selector(col_horizon, horizon_options, str(default_horizon))
+    default_news_limit = int(settings.context_agent.get("news_analysis", {}).get("max_headlines_per_symbol", 50))
+    news_limit = st.slider(
+        "Headlines to analyze",
+        min_value=5,
+        max_value=200,
+        value=min(max(default_news_limit, 5), 200),
+        step=5,
+        help="How many headlines to gather and feed into this symbol's news analysis and the decision. Free providers may return fewer.",
+    )
+    analyze_requested = st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon.")
+    if analyze_requested:
+        _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit, refresh=True)
+    elif st.session_state.get("latest_analysis") is not None:
+        _render_analysis(settings, selected_symbol, refresh=False)
+
+
+def _initialize_dashboard_cache(settings) -> None:
+    cache_config = str(settings.path)
+    if st.session_state.get("_dashboard_cache_config") == cache_config:
+        return
+    for key in CACHE_KEYS:
+        st.session_state.pop(key, None)
+    for key, value in load_dashboard_cache(settings).items():
+        st.session_state[key] = value
+    st.session_state["_dashboard_cache_config"] = cache_config
+
+
+def _persist_dashboard_cache(settings) -> None:
+    save_dashboard_cache(settings, {key: st.session_state.get(key) for key in CACHE_KEYS if key in st.session_state})
 
 
 def _render_scanner(settings, symbols: list[str]) -> None:
@@ -203,6 +227,7 @@ def _render_scanner(settings, symbols: list[str]) -> None:
         progress.progress(1.0, text="Scanner ready")
         st.session_state.latest_scan_results = results
         st.session_state.latest_scan_symbols = [result.snapshot.symbol for result in results]
+        _persist_dashboard_cache(settings)
     results = st.session_state.get("latest_scan_results")
     if results is None:
         return
@@ -356,6 +381,7 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
         frame = fetch_market_data(symbol, settings, provider)
         progress.progress(1.0, text=f"{symbol} analysis ready")
         st.session_state.latest_analysis = {"result": result, "frame": frame}
+        _persist_dashboard_cache(settings)
     else:
         latest = st.session_state.get("latest_analysis")
         if latest is None:
@@ -626,6 +652,13 @@ def _render_news_decision_panel(result) -> None:
     news = context.news_analysis or {}
     evidence = context.evidence or []
     considered = bool(news or evidence)
+    enrichment = getattr(result, "news_enrichment", {}) or {}
+    enrichment_status = str(enrichment.get("status", "unknown"))
+
+    if enrichment_status == "unavailable":
+        st.warning(f"Rich news enrichment is unavailable for this analysis: {enrichment.get('error', 'unknown error')}")
+    elif enrichment_status == "degraded":
+        st.warning(f"Rich news enrichment is degraded: {enrichment.get('error', 'review the analyzer status below')}")
 
     if not considered:
         st.info(
@@ -682,7 +715,7 @@ def _render_news_decision_panel(result) -> None:
     if evidence:
         with _remembered_expander(f"Headlines used in this decision ({len(evidence)})", f"decision_news_evidence_{result.snapshot.symbol}", expanded=False):
             ev_df = pd.DataFrame(evidence)
-            columns = [column for column in ["provider", "published", "category", "sentiment", "impact", "day_trader_relevance", "freshness", "title", "url"] if column in ev_df.columns]
+            columns = [column for column in ["provider", "published", "classification_provider", "category", "sentiment", "impact", "day_trader_relevance", "freshness", "title", "url"] if column in ev_df.columns]
             st.dataframe(ev_df[columns], width="stretch", hide_index=True, column_config=_headline_column_config())
 
 
@@ -1017,6 +1050,7 @@ def _render_news(settings, symbols: list[str]) -> None:
             return
         progress.progress(1.0, text="News feed ready")
         st.session_state.latest_news_feed = feed
+        _persist_dashboard_cache(settings)
     feed = st.session_state.get("latest_news_feed")
     if feed is not None:
         _render_news_feed(feed, headline_limit)
@@ -1059,8 +1093,13 @@ def _render_news_feed(feed: dict, headline_limit: int) -> None:
         _render_symbol_news_summary(summary)
 
     st.subheader("Headline Table")
+    headline_columns = [
+        column
+        for column in ["symbol", "classification_provider", "category", "sentiment", "impact", "day_trader_relevance", "published", "provider", "title", "url"]
+        if column in df.columns
+    ]
     st.dataframe(
-        df[["symbol", "category", "sentiment", "impact", "day_trader_relevance", "published", "provider", "title", "url"]],
+        df[headline_columns],
         width="stretch",
         hide_index=True,
         column_config=_headline_column_config(),
@@ -1093,6 +1132,7 @@ def _render_backtest(settings, symbols: list[str]) -> None:
         progress.progress(1.0, text="Backtest ready")
         st.session_state.latest_backtest_report = report
         st.session_state.latest_backtest_symbols = selected_symbols
+        _persist_dashboard_cache(settings)
     report = st.session_state.get("latest_backtest_report")
     if report is not None:
         completed_symbols = st.session_state.get("latest_backtest_symbols", [])
@@ -1153,18 +1193,21 @@ def _settings_llm_summary(settings) -> str:
 def _render_news_capability_note(settings) -> None:
     llm_cfg = settings.context_agent.get("news_analysis", {}).get("llm", {})
     scrape_cfg = settings.context_agent.get("news_analysis", {}).get("article_scraping", {})
+    classifier_cfg = settings.context_agent.get("news_analysis", {}).get("headline_classifier", {})
     sources = ", ".join(str(source) for source in settings.context_agent.get("sources", [])) or "none"
     llm_status = "enabled" if llm_cfg.get("enabled", False) else "disabled"
     provider = str(llm_cfg.get("provider", "heuristic"))
     fallback = "enabled" if llm_cfg.get("fallback_to_heuristic", True) else "disabled"
     scraping = "enabled" if scrape_cfg.get("enabled", False) else "disabled"
+    classifier = str(classifier_cfg.get("provider", "keyword")) if classifier_cfg.get("enabled", False) else "keyword"
+    classifier_fallback = "enabled" if classifier_cfg.get("fallback_to_keyword", True) else "disabled"
     with _remembered_expander("News coverage and limits", "news_coverage_limits", expanded=False):
         st.write(
             "This feed aggregates configured headline metadata and provider links. "
             "When article scraping is enabled, it fetches a short article excerpt for the LLM; it does not store full article bodies."
         )
-        st.write("Headline-row category, sentiment, impact, and relevance fields use the built-in keyword classifier. The configured LLM produces the per-symbol summary.")
-        st.write(f"Configured sources: {sources}. LLM summarizer: {llm_status} ({provider}). Heuristic fallback: {fallback}. Article excerpts: {scraping}.")
+        st.write("Headline rows use the configured classifier when it succeeds. Rows explicitly show their classifier provenance; keyword fallback is never hidden.")
+        st.write(f"Configured sources: {sources}. Headline classifier: {classifier}. Keyword fallback: {classifier_fallback}. LLM summarizer: {llm_status} ({provider}). Heuristic summary fallback: {fallback}. Article excerpts: {scraping}.")
         st.write("If fallback is disabled and the configured LLM endpoint is unavailable, the News tab stops instead of producing a heuristic summary.")
 
 
@@ -1176,7 +1219,8 @@ def _render_news_coverage(coverage: dict) -> None:
     scrape_status = f"article excerpts ({coverage.get('article_excerpt_count', 0)} fetched)" if coverage.get("article_body_scraping") else "headline/link mode"
     st.caption(
         f"Coverage: {sources}; active headline sources: {headline_sources}; LLM provider: {coverage.get('llm_provider', 'heuristic')}; "
-        f"fallback: {'enabled' if coverage.get('fallback_to_heuristic') else 'disabled'}; mode: {scrape_status}."
+        f"headline classifiers used: {', '.join(coverage.get('classification_providers', [])) or 'keyword'}; "
+        f"summary fallback: {'enabled' if coverage.get('fallback_to_heuristic') else 'disabled'}; mode: {scrape_status}."
     )
     source_counts = coverage.get("source_counts", {})
     if source_counts:
@@ -1230,7 +1274,7 @@ def _render_symbol_news_summary(summary: dict) -> None:
         if sources.empty:
             st.info("No linked sources were returned.")
         else:
-            columns = [column for column in ["provider", "published", "category", "sentiment", "impact", "title", "url"] if column in sources.columns]
+            columns = [column for column in ["provider", "published", "classification_provider", "category", "sentiment", "impact", "title", "url"] if column in sources.columns]
             st.dataframe(
                 sources[columns],
                 width="stretch",
@@ -1248,6 +1292,7 @@ def _headline_column_config() -> dict:
         "day_trader_relevance": st.column_config.NumberColumn("Relevance", format="%.2f", help=HELP_TEXT["headline_relevance"]),
         "published": st.column_config.TextColumn("Published", help="Timestamp returned by the news provider when available."),
         "provider": st.column_config.TextColumn("Provider", help="Source provider that returned the item."),
+        "classification_provider": st.column_config.TextColumn("Classifier", help="Analyzer that classified this row. `keyword` means the built-in fallback; LLM-backed rows show their configured provider."),
         "title": st.column_config.TextColumn("Title", help="Headline used for catalyst and sentiment analysis."),
         "url": st.column_config.LinkColumn("Link", help="Source link for manual review."),
     }

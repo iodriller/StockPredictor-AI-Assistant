@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 
 import yaml
 
@@ -8,7 +10,7 @@ from stockpredictor.config import load_settings
 from stockpredictor.context import fetch_news_items
 import pytest
 
-from stockpredictor.news import NewsAnalysisError, _attach_article_excerpts, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, analyze_symbol_news, build_news_feed
+from stockpredictor.news import NewsAnalysisError, _attach_article_excerpts, _call_openai_compatible_chat, _classify_headlines, _extract_article_text, _normalize_llm_summary, _strip_json_fence, analyze_symbol_news, build_news_feed
 
 
 def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch) -> None:
@@ -275,6 +277,33 @@ def test_news_feed_keeps_multi_symbol_results_when_one_llm_summary_fails(tmp_pat
     assert providers == {"GOOD": "localdeploy", "BAD": "llm_error"}
 
 
+def test_news_feed_summarizes_symbols_with_bounded_workers(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50, **kwargs: [{"symbol": symbol, "title": f"{symbol} headline"} for symbol in symbols],
+    )
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_summary(symbol, items, settings):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return {"symbol": symbol, "analysis_provider": "fixture", "sources": items}
+
+    monkeypatch.setattr("stockpredictor.news._summarize_symbol_news", fake_summary)
+
+    build_news_feed(["AAA", "BBB", "CCC"], settings, limit=6)
+
+    assert max_active == 2
+
+
 def test_news_feed_can_attach_article_excerpts(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
     raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
@@ -330,6 +359,37 @@ def test_article_excerpt_limit_caps_failed_attempts(monkeypatch) -> None:
 
     assert len(calls) == 3
     assert len(enriched) == 8
+
+
+def test_headline_classifier_records_llm_provenance(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.news._llm_headline_classifications",
+        lambda symbol, items, config: ([{"category": "analyst_action", "sentiment": "bullish", "impact": 0.8}], "localdeploy"),
+    )
+
+    classified = _classify_headlines(
+        [{"symbol": "TEST", "title": "Opaque headline", "category": "other", "sentiment": "neutral", "impact": 0.0, "freshness": 1.0}],
+        {"headline_classifier": {"enabled": True}},
+    )
+
+    assert classified[0]["category"] == "analyst_action"
+    assert classified[0]["sentiment"] == "bullish"
+    assert classified[0]["impact"] == 0.8
+    assert classified[0]["classification_provider"] == "localdeploy"
+
+
+def test_headline_classifier_falls_back_to_keyword_with_provenance(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.news._llm_headline_classifications",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    classified = _classify_headlines(
+        [{"symbol": "TEST", "title": "Opaque headline", "category": "other", "sentiment": "neutral", "impact": 0.0, "freshness": 1.0, "classification_provider": "keyword"}],
+        {"headline_classifier": {"enabled": True, "fallback_to_keyword": True}},
+    )
+
+    assert classified[0]["classification_provider"] == "keyword"
 
 
 def test_news_feed_scrapes_ranked_headlines_first(tmp_path: Path, monkeypatch) -> None:
@@ -419,6 +479,50 @@ def test_fetch_news_items_distributes_limit_across_symbols(monkeypatch) -> None:
     assert [item["symbol"] for item in items] == ["AAA", "AAA", "AAA", "BBB", "BBB", "BBB"]
 
 
+def test_fetch_news_items_dedupes_syndicated_headlines_with_different_links(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "stockpredictor.context._yfinance_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yfinance_news", "title": "Same syndicated story", "url": "https://example.com/one"}],
+    )
+    monkeypatch.setattr(
+        "stockpredictor.context._yahoo_search_news",
+        lambda symbol, limit=25: [{"symbol": symbol, "source": "yahoo_search_news", "title": "  SAME syndicated   story ", "url": "https://example.com/two"}],
+    )
+
+    items = fetch_news_items(["TEST"], limit=5, sources=["yfinance_news", "yahoo_search_news"])
+
+    assert len(items) == 1
+
+
+def test_fetch_news_items_uses_bounded_parallel_sources(monkeypatch) -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_fetch(symbol, limit=25, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return [{"symbol": symbol, "source": "fixture", "title": f"{symbol} headline"}]
+
+    monkeypatch.setattr("stockpredictor.context._yfinance_news", fake_fetch)
+    monkeypatch.setattr("stockpredictor.context._yahoo_search_news", fake_fetch)
+    monkeypatch.setattr("stockpredictor.context._google_news_rss", fake_fetch)
+
+    fetch_news_items(
+        ["AAA", "BBB"],
+        limit=6,
+        sources=["yfinance_news", "yahoo_search_news", "google_news_rss"],
+        source_config={"fetch_workers": 3},
+    )
+
+    assert 1 < max_active <= 3
+
+
 def test_normalize_llm_summary_handles_non_list_flags() -> None:
     summary = _normalize_llm_summary(
         {
@@ -473,6 +577,7 @@ def _settings(tmp_path: Path):
     raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
     raw["data"]["provider"] = "synthetic"
     raw["context_agent"]["news_analysis"]["llm"]["enabled"] = False
+    raw["context_agent"]["news_analysis"]["headline_classifier"]["enabled"] = False
     raw["context_agent"]["news_analysis"]["article_scraping"]["enabled"] = False
     config_path = tmp_path / "news_config.yaml"
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")

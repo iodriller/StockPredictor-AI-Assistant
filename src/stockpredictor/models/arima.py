@@ -24,7 +24,7 @@ class ArimaPriceModel(PredictionModel):
             int(model_cfg.get("max_train_rows", settings.models.get("lookback_rows", 220))),
         )
         max_rows = min(configured_rows, len(frame))
-        close = frame["Close"].tail(max_rows).astype(float)
+        close = frame["Close"].tail(max_rows).astype(float).reset_index(drop=True)
         current = float(close.iloc[-1])
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
