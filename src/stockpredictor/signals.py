@@ -29,7 +29,7 @@ def fuse_signals(
     horizon_profile = settings.horizon_profile(horizon)
     weights = _resolve_weights(settings, horizon_profile)
     thresholds = settings.signal_fusion.get("thresholds", {})
-    model_score, model_scores, disagreement = _model_component(predictions)
+    model_score, model_scores, disagreement = _model_component(predictions, settings)
     technical_score = clamp(features.technical_score, -1.0, 1.0)
     context_score = clamp(context.score, -1.0, 1.0)
     sentiment_score = {"bullish": 0.4, "bearish": -0.4}.get(context.sentiment, 0.0)
@@ -148,11 +148,26 @@ def _resolve_weights(settings: Settings, horizon_profile: dict) -> dict[str, flo
     return _normalized_weights(merged)
 
 
-def _model_component(predictions: list[ModelPrediction]) -> tuple[float, dict[str, float], bool]:
+def _model_component(predictions: list[ModelPrediction], settings: Settings) -> tuple[float, dict[str, float], bool]:
+    """Turn model forecasts into a [-1, 1] directional score.
+
+    Two calibration fixes over the old `expected_return / 0.05 * confidence`:
+    1. The reference move scales with the forecast horizon (a 5-day forecast and a
+       20-day forecast are not judged on the same yardstick), so a healthy trend
+       forecast is no longer crushed toward zero by a flat 5% divisor.
+    2. Confidence weights the vote down to a floor instead of multiplying it away,
+       so a moderate-confidence but clearly directional model still counts.
+    """
+    cfg = settings.signal_fusion
+    per_day = float(cfg.get("model_reference_move_per_day_pct", 0.002))
+    floor = float(cfg.get("model_reference_move_floor_pct", 0.01))
+    conf_floor = clamp(float(cfg.get("model_confidence_floor", 0.4)), 0.0, 1.0)
     scores: dict[str, float] = {}
     for prediction in predictions:
-        raw = clamp(prediction.expected_return / 0.05, -1.0, 1.0) * clamp(prediction.confidence, 0.0, 1.0)
-        scores[prediction.model] = raw
+        reference = max(floor, per_day * max(1, int(prediction.horizon_days)))
+        direction_strength = clamp(prediction.expected_return / reference, -1.0, 1.0)
+        conf_weight = clamp(conf_floor + (1.0 - conf_floor) * clamp(prediction.confidence, 0.0, 1.0), 0.0, 1.0)
+        scores[prediction.model] = direction_strength * conf_weight
     valid_scores = [score for score in scores.values() if score != 0]
     disagreement = any(score > 0.05 for score in valid_scores) and any(score < -0.05 for score in valid_scores)
     return (_average(valid_scores), scores, disagreement)

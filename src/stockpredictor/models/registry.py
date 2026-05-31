@@ -10,12 +10,14 @@ from stockpredictor.models.arima import ArimaPriceModel
 from stockpredictor.models.base import horizon_model_params
 from stockpredictor.models.baseline import BaselineTrendModel
 from stockpredictor.models.gaussian_process import GaussianProcessPriceModel
+from stockpredictor.models.momentum import MomentumModel
 
 
 MODEL_REGISTRY = {
     "baseline": BaselineTrendModel,
     "gaussian_process": GaussianProcessPriceModel,
     "arima": ArimaPriceModel,
+    "momentum": MomentumModel,
 }
 
 

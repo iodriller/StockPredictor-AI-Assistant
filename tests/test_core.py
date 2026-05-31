@@ -60,6 +60,59 @@ def test_disabled_features_are_not_calculated(tmp_path: Path) -> None:
     assert "macd" not in features.indicators
 
 
+def _trend_frame(values) -> pd.DataFrame:
+    import numpy as np
+
+    close = np.asarray(values, dtype=float)
+    index = pd.date_range("2025-01-01", periods=len(close), freq="D")
+    return pd.DataFrame(
+        {"Open": close, "High": close * 1.01, "Low": close * 0.99, "Close": close, "Volume": 2_000_000.0},
+        index=index,
+    )
+
+
+def test_momentum_model_is_bullish_on_recent_reversal(tmp_path: Path) -> None:
+    import numpy as np
+
+    settings = _test_settings(tmp_path, enabled_models=["momentum"])
+    # Down for 170 bars, then a clear reversal up over the last 30 — bullish "now".
+    close = np.concatenate([np.linspace(140, 90, 170), np.linspace(90, 120, 30)])
+    prediction = run_models("REV", _trend_frame(close), settings, horizon="swing")[0]
+
+    assert prediction.model == "momentum"
+    assert prediction.expected_return > 0  # reads the recent reversal, not the stale downtrend
+    assert prediction.direction == "up"
+
+
+def test_baseline_recency_weighting_softens_stale_downtrend(tmp_path: Path) -> None:
+    import numpy as np
+
+    from stockpredictor.models.baseline import BaselineTrendModel
+
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    close = np.concatenate([np.linspace(140, 90, 170), np.linspace(90, 120, 30)])
+    prediction = BaselineTrendModel().predict("REV", _trend_frame(close), settings)
+
+    # The old unweighted fit returned roughly -0.23 here; recency weighting must pull
+    # it much closer to flat so a fresh reversal is not reported as a strong decline.
+    assert prediction.expected_return > -0.10
+
+
+def test_model_component_scales_with_horizon(tmp_path: Path) -> None:
+    from stockpredictor.contracts import ModelPrediction
+    from stockpredictor.signals import _model_component
+
+    settings = _test_settings(tmp_path)
+    # A modest but real +1.5% / 5-day forecast should produce a meaningful (not
+    # crushed) directional vote under the horizon-aware reference scale.
+    prediction = ModelPrediction(
+        model="momentum", symbol="X", horizon_days=5, direction="up",
+        expected_return=0.015, confidence=0.6, predicted_price=101.5,
+    )
+    score, _, _ = _model_component([prediction], settings)
+    assert score > 0.4
+
+
 def test_gaussian_process_model_outputs_prediction(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path, enabled_models=["gaussian_process"])
     frame = SyntheticProvider().fetch("TEST", "6mo", "1d")

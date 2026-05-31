@@ -125,7 +125,10 @@ def apply_risk_controls(
             no_trade_reasons=_no_trade_reasons(["volatility above configured maximum"]),
         )
 
-    max_vwap_distance = float(risk_cfg.get("max_entry_distance_from_vwap_pct", 1.0))
+    # Horizon-aware extension guard. An 8% cap off the session VWAP is a sane
+    # "don't chase" rule intraday, but a swing/position entry legitimately sits far
+    # from a long-window VWAP, so the same cap would block every trending name.
+    max_vwap_distance = float(horizon_profile.get("max_entry_distance_from_vwap_pct", risk_cfg.get("max_entry_distance_from_vwap_pct", 1.0)))
     if vwap and abs(latest_price / vwap - 1) > max_vwap_distance:
         adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: price too extended from VWAP"])
         return adjusted, RiskPlan(

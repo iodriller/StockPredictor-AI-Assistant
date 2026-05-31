@@ -57,11 +57,16 @@ features:
 
 models:
   enabled:
+    - momentum
     - baseline
     - gaussian_process
     - arima
   horizon_days: 5
   lookback_rows: 180
+  momentum:
+    continuation_factor: 0.6   # how much of recent realized momentum is projected forward
+  baseline:
+    recency_decay: 5.0         # exponential emphasis on recent bars in the trend fit (higher = more recent-weighted)
   gaussian_process:
     kernel: matern
     max_train_rows: 160
@@ -71,6 +76,13 @@ models:
     max_train_rows: 220
 
 signal_fusion:
+  # Model-score scaling. expected_return is judged against a horizon-aware reference
+  # move (per_day x horizon_days, floored), not a flat 5%, so a healthy trend
+  # forecast is not crushed to zero. Confidence weights the vote down to a floor
+  # instead of multiplying it away.
+  model_reference_move_per_day_pct: 0.002
+  model_reference_move_floor_pct: 0.01
+  model_confidence_floor: 0.40
   weights:
     models: 0.40
     technicals: 0.35
@@ -227,6 +239,7 @@ horizons:
       target_r_multiple: 1.5
       entry_cushion_atr: 0.25
       entry_cushion_pct: 0.002
+      max_entry_distance_from_vwap_pct: 0.60   # swing entries sit far from a long-window VWAP; intraday stays tight
       weights:
         models: 0.35
         technicals: 0.30
@@ -240,6 +253,7 @@ horizons:
       target_r_multiple: 2.5
       entry_cushion_atr: 0.40
       entry_cushion_pct: 0.004
+      max_entry_distance_from_vwap_pct: 1.00   # position entries are trend-following; do not block on VWAP distance
       weights:
         models: 0.45
         technicals: 0.30

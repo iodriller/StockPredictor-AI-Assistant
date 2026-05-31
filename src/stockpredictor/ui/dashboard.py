@@ -10,7 +10,9 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from stockpredictor.backtesting import run_backtest
-from stockpredictor.config import ConfigError, load_settings
+from copy import deepcopy
+
+from stockpredictor.config import ConfigError, Settings, load_settings
 from stockpredictor.data import fetch_market_data, get_market_data_provider
 from stockpredictor.dashboard_cache import CACHE_KEYS, load_dashboard_cache, save_dashboard_cache
 from stockpredictor.journal import (
@@ -178,11 +180,12 @@ def _render_trade_plan_workspace(settings, symbols: list[str]) -> None:
         step=5,
         help="How many headlines to gather and feed into this symbol's news analysis and the decision. Free providers may return fewer.",
     )
+    tuned_settings = _render_tuning_controls(settings, selected_horizon)
     analyze_requested = st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon.")
     if analyze_requested:
-        _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit, refresh=True)
+        _render_analysis(tuned_settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit, refresh=True)
     elif st.session_state.get("latest_analysis") is not None:
-        _render_analysis(settings, selected_symbol, refresh=False)
+        _render_analysis(tuned_settings, selected_symbol, refresh=False)
 
 
 def _initialize_dashboard_cache(settings) -> None:
@@ -256,6 +259,69 @@ def _render_scanner(settings, symbols: list[str]) -> None:
         column_config=_scanner_column_config(compact=True),
     )
     _render_scanner_detail(df)
+
+
+_MODEL_NOTES = {
+    "momentum": "Feature-aware: scores moving-average alignment, mid-MA slope, and recent realized momentum. Reads what the chart shows; best at catching a fresh turn.",
+    "baseline": "Recency-weighted linear trend fit. Captures the prevailing direction; weighting keeps a fresh reversal from being buried by stale history.",
+    "gaussian_process": "Smoothed drift from recent log-returns with an uncertainty band. A confirmation/uncertainty estimate, not a precise price target.",
+    "arima": "Univariate time-series forecast on close. Often near a random walk on liquid names, so it tends to be a low-confidence confirmation.",
+}
+
+_MODELS_DISCLAIMER = (
+    "All models are price/technical only — they do not read fundamentals (valuation, "
+    "earnings growth, balance sheet). Use them as one input alongside the chart, news, "
+    "and risk plan, not as a standalone buy/sell call."
+)
+
+
+def _render_tuning_controls(settings, horizon: str) -> "Settings":
+    """Expose the key model/signal parameters as live controls so a trader can tune
+    the analysis without editing the config file. Returns a Settings with the
+    overrides applied (base weights and the active horizon profile's weights, plus
+    thresholds, MA windows, and the trade confidence gate)."""
+    with _remembered_expander("Model & signal tuning", "deepdive_tuning", expanded=False):
+        st.caption("Overrides apply to this analysis only. Defaults come from the config file; clear them by resetting the values.")
+        ma_default = ",".join(str(int(value)) for value in settings.features.get("ma_windows", [9, 20, 50]))
+        ma_text = st.text_input("Moving-average windows", value=ma_default, help="Comma-separated lookbacks for the trend/MA features and chart, e.g. 9,20,50.")
+
+        weights = _resolve_active_weights(settings, horizon)
+        st.caption("Signal weights (auto-normalized). These set how much each input drives the fused score.")
+        wc = st.columns(5)
+        w_models = wc[0].number_input("Models", 0.0, 1.0, float(weights.get("models", 0.4)), 0.05, help="Weight of the ML model forecasts.")
+        w_tech = wc[1].number_input("Technicals", 0.0, 1.0, float(weights.get("technicals", 0.35)), 0.05, help="Weight of trend/VWAP/MA/MACD/RSI signals.")
+        w_intra = wc[2].number_input("Intraday", 0.0, 1.0, float(weights.get("intraday", 0.0)), 0.05, help="Weight of intraday session signals (matters most for the intraday horizon).")
+        w_ctx = wc[3].number_input("Context/News", 0.0, 1.0, float(weights.get("context", 0.2)), 0.05, help="Weight of the news/context catalyst score.")
+        w_sent = wc[4].number_input("Sentiment", 0.0, 1.0, float(weights.get("sentiment", 0.05)), 0.05, help="Weight of the news sentiment tilt.")
+
+        thresholds = settings.signal_fusion.get("thresholds", {})
+        tc = st.columns(3)
+        long_score = tc[0].slider("Trade score", 0.10, 0.80, float(thresholds.get("long_score", 0.35)), 0.01, help="Score magnitude needed to call a directional (long/short) trade. Lower = more trades, lower selectivity.")
+        watch_score = tc[1].slider("Watch score", 0.05, 0.50, float(thresholds.get("watch_score", 0.18)), 0.01, help="Score magnitude needed to flag a watch.")
+        min_conf_trade = tc[2].slider("Min confidence to trade", 0.10, 0.80, float(settings.risk.get("min_confidence_for_trade", 0.40)), 0.01, help="Risk-layer confidence gate. Lower = more trades, lower quality.")
+
+    parsed_windows = [int(part) for part in ma_text.replace(" ", "").split(",") if part.strip().isdigit()]
+    overrides_weights = {"models": w_models, "technicals": w_tech, "intraday": w_intra, "context": w_ctx, "sentiment": w_sent}
+    new_raw = deepcopy(settings.raw)
+    new_raw.setdefault("features", {})["ma_windows"] = parsed_windows or settings.features.get("ma_windows", [9, 20, 50])
+    sf = new_raw.setdefault("signal_fusion", {})
+    sf.setdefault("weights", {}).update(overrides_weights)
+    sf.setdefault("thresholds", {}).update({"long_score": long_score, "short_score": -abs(long_score), "watch_score": watch_score})
+    new_raw.setdefault("risk", {})["min_confidence_for_trade"] = min_conf_trade
+    # The active horizon profile's weights win over base weights in fusion, so apply
+    # the override there too — otherwise editing weights would have no effect.
+    profiles = new_raw.setdefault("horizons", {}).setdefault("profiles", {})
+    if horizon in profiles and isinstance(profiles[horizon], dict) and "weights" in profiles[horizon]:
+        profiles[horizon]["weights"].update(overrides_weights)
+    return Settings(raw=new_raw, path=settings.path)
+
+
+def _resolve_active_weights(settings, horizon: str) -> dict:
+    base = dict(settings.signal_fusion.get("weights", {}))
+    profile = (settings.horizons.get("profiles") or {}).get(horizon, {})
+    if isinstance(profile, dict) and isinstance(profile.get("weights"), dict):
+        base.update(profile["weights"])
+    return base
 
 
 def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
@@ -480,6 +546,21 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     with _remembered_expander("Model Details", "analysis_model_details", expanded=False):
         model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
         st.dataframe(model_df, width="stretch", hide_index=True, column_config=_model_column_config())
+        notes = [
+            {"model": prediction.model, "what it is": _MODEL_NOTES.get(prediction.model, "Model forecast.")}
+            for prediction in result.predictions
+        ]
+        if notes:
+            st.dataframe(
+                pd.DataFrame(notes),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "model": st.column_config.TextColumn("Model", help="Prediction model."),
+                    "what it is": st.column_config.TextColumn("What it is / limits", help="Plain-language description of the model and what it is good and bad at."),
+                },
+            )
+        st.caption(_MODELS_DISCLAIMER)
 
     with _remembered_expander("Full Signal / Risk Data", "analysis_full_signal_risk", expanded=False):
         st.dataframe(
