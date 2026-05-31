@@ -17,3 +17,19 @@ def test_cli_accepts_config_on_subcommand_only(monkeypatch, capsys) -> None:
 
     assert seen["path"] == "configs/custom.yaml"
     assert capsys.readouterr().out.strip() == "[]"
+
+
+def test_dashboard_binds_to_localhost_by_default(monkeypatch) -> None:
+    seen = {}
+
+    def fake_call(command):
+        seen["command"] = command
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", fake_call)
+
+    assert cli.main(["dashboard", "--config", "configs/default.example.yaml"]) == 0
+
+    command = seen["command"]
+    address_index = command.index("--server.address")
+    assert command[address_index + 1] == "127.0.0.1"

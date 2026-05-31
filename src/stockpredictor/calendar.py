@@ -21,7 +21,7 @@ from .contracts import CalendarContext
 LOGGER = logging.getLogger(__name__)
 
 
-def build_calendar_context(symbol: str, settings: Settings) -> CalendarContext:
+def build_calendar_context(symbol: str, settings: Settings, include_live_sources: bool = True) -> CalendarContext:
     market_tz = str(settings.app.get("market_timezone") or settings.app.get("timezone") or "America/New_York")
     now_market = _now_in_tz(market_tz)
     session, mins_to_open, mins_to_close = _classify_session(now_market)
@@ -34,7 +34,7 @@ def build_calendar_context(symbol: str, settings: Settings) -> CalendarContext:
     )
 
     cfg = settings.raw.get("calendar", {}) or {}
-    if cfg.get("earnings_enabled", True):
+    if include_live_sources and cfg.get("earnings_enabled", True):
         earnings_date = _next_earnings_date(symbol)
         if earnings_date is not None:
             context.next_earnings_date = earnings_date.isoformat()

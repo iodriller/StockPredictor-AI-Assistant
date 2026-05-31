@@ -36,6 +36,7 @@ def analyze_symbol(
     include_session: bool = True,
     include_snapshot: bool = True,
     news_limit: int | None = None,
+    include_news_analysis: bool = True,
 ) -> AnalysisResult:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
@@ -65,16 +66,17 @@ def analyze_symbol(
     sector_context = None
     calendar_context = None
     if include_market_context and data_frame is None:
+        allow_live_enrichment = getattr(provider, "name", "") != "synthetic"
         market_state = build_market_state(settings, provider)
-        sector_context = build_sector_context(symbol, settings, provider)
-        calendar_context = build_calendar_context(symbol, settings)
+        sector_context = build_sector_context(symbol, settings, provider, include_live_lookup=allow_live_enrichment)
+        calendar_context = build_calendar_context(symbol, settings, include_live_sources=allow_live_enrichment)
 
     predictions = run_models(symbol, frame, settings, model_names=model_names, horizon=horizon_name)
     # Deep-dive (live) requests fold the rich news analysis into the decision so the
     # trade plan both uses and shows the gathered news. Scans and backtests skip this
     # to stay fast and avoid per-symbol LLM calls.
     news_analysis = None
-    if include_context and data_frame is None and _news_in_decision_enabled(settings):
+    if include_context and include_news_analysis and data_frame is None and _news_in_decision_enabled(settings):
         try:
             news_analysis = analyze_symbol_news(symbol, settings, limit=news_limit)
         except Exception as exc:  # never let a news outage break the analysis
@@ -143,7 +145,7 @@ def scan_symbols(
     for index, symbol in enumerate(selected_symbols, start=1):
         if progress_callback is not None:
             progress_callback((index - 1) / total, f"Analyzing {symbol} ({index}/{total})")
-        results.append(analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon))
+        results.append(analyze_symbol(symbol, settings=settings, provider=provider, horizon=horizon, include_news_analysis=False))
     if progress_callback is not None:
         progress_callback(1.0, f"Scanner finished for {len(results)} symbol(s)")
     action_rank = {"long": 0, "short": 0, "watch": 1, "low_confidence": 2, "no_trade": 3}
@@ -238,7 +240,11 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
 
 def _news_in_decision_enabled(settings: Settings) -> bool:
     news_cfg = settings.context_agent.get("news_analysis", {})
-    return bool(news_cfg.get("enabled", False)) and bool(news_cfg.get("use_in_decision", True))
+    return (
+        bool(settings.context_agent.get("enabled", False))
+        and bool(news_cfg.get("enabled", False))
+        and bool(news_cfg.get("use_in_decision", True))
+    )
 
 
 def _pct_distance(price: float, level: object) -> float | None:

@@ -157,7 +157,7 @@ def apply_risk_controls(
         )
         stop_loss = min(entry - entry * 0.003, structural_stop - atr * 0.20)
         raw_target = entry + abs(entry - stop_loss) * _primary_target_multiple(risk_cfg, horizon_profile)
-        targets, target_source = _merge_structural_target(raw_target, resistance, long=True)
+        targets, target_source = _merge_structural_target(raw_target, resistance, entry, long=True)
         invalidation = "Long idea is invalid below stop loss, nearby support, or sustained loss of VWAP."
     else:
         fallback_stop = entry + stop_distance
@@ -168,7 +168,7 @@ def apply_risk_controls(
         )
         stop_loss = max(entry + entry * 0.003, structural_stop + atr * 0.20)
         raw_target = entry - abs(entry - stop_loss) * _primary_target_multiple(risk_cfg, horizon_profile)
-        targets, target_source = _merge_structural_target(raw_target, support, long=False)
+        targets, target_source = _merge_structural_target(raw_target, support, entry, long=False)
         invalidation = "Short idea is invalid above stop loss, nearby resistance, or sustained reclaim of VWAP."
 
     risk_reward = abs(targets[0] - entry) / abs(entry - stop_loss)
@@ -270,12 +270,12 @@ def _entry_zone(
     return (price - cushion * 0.5, price + cushion)
 
 
-def _merge_structural_target(raw_target: float, structural_level: float, long: bool) -> tuple[list[float], str]:
+def _merge_structural_target(raw_target: float, structural_level: float, entry: float, long: bool) -> tuple[list[float], str]:
     if not structural_level:
         return [raw_target], "r_multiple"
-    if long and 0 < structural_level < raw_target:
+    if long and entry < structural_level < raw_target:
         return [structural_level], "structural_resistance"
-    if not long and structural_level > raw_target > 0:
+    if not long and 0 < raw_target < structural_level < entry:
         return [structural_level], "structural_support"
     return [raw_target], "r_multiple"
 

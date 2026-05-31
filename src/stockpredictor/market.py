@@ -81,6 +81,7 @@ def build_sector_context(
     symbol: str,
     settings: Settings,
     provider: MarketDataProvider | None = None,
+    include_live_lookup: bool = True,
 ) -> SectorContext:
     cfg = settings.raw.get("market_context", {}) or {}
     if not cfg.get("sector_enabled", True):
@@ -91,7 +92,7 @@ def build_sector_context(
 
     sector_name = "unknown"
     etf = symbol_overrides.get(symbol.upper(), "")
-    if not etf:
+    if not etf and include_live_lookup:
         sector_name = _yfinance_sector(symbol) or "unknown"
         etf = sector_etfs.get(sector_name, "")
 

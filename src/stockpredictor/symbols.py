@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+LOGGER = logging.getLogger(__name__)
 
 FALLBACK_SYMBOLS = [
     {"symbol": "AAPL", "name": "Apple Inc.", "source": "fallback"},
@@ -57,8 +59,8 @@ def load_symbol_universe(cache_dir: str | Path = ".cache") -> list[dict[str, Any
     if cache_path.exists():
         try:
             return _parse_sec_company_tickers(json.loads(cache_path.read_text(encoding="utf-8")), source="sec_cache")
-        except (OSError, json.JSONDecodeError, TypeError, KeyError):
-            pass
+        except (OSError, json.JSONDecodeError, TypeError, KeyError) as exc:
+            LOGGER.warning("Ignoring invalid cached SEC symbol universe at %s: %s", cache_path, exc)
     try:
         import httpx
 
@@ -72,7 +74,8 @@ def load_symbol_universe(cache_dir: str | Path = ".cache") -> list[dict[str, Any
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(response.text, encoding="utf-8")
         return _parse_sec_company_tickers(response.json(), source="sec")
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("SEC symbol universe fetch failed; using the small fallback list: %s", exc)
         return FALLBACK_SYMBOLS
 
 

@@ -8,7 +8,7 @@ from stockpredictor.config import load_settings
 from stockpredictor.context import fetch_news_items
 import pytest
 
-from stockpredictor.news import NewsAnalysisError, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, analyze_symbol_news, build_news_feed
+from stockpredictor.news import NewsAnalysisError, _attach_article_excerpts, _call_openai_compatible_chat, _extract_article_text, _normalize_llm_summary, _strip_json_fence, analyze_symbol_news, build_news_feed
 
 
 def test_news_feed_builds_grand_summary_with_sources(tmp_path: Path, monkeypatch) -> None:
@@ -311,6 +311,47 @@ def test_news_feed_can_attach_article_excerpts(tmp_path: Path, monkeypatch) -> N
     assert feed["coverage"]["article_body_scraping"] is True
     assert feed["coverage"]["article_excerpt_count"] == 1
     assert "raised guidance" in feed["headlines"][0]["article_excerpt"].lower()
+
+
+def test_article_excerpt_limit_caps_failed_attempts(monkeypatch) -> None:
+    calls = []
+
+    def fail_fetch(url, **kwargs):
+        calls.append(url)
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr("stockpredictor.news._fetch_article_excerpt", fail_fetch)
+    items = [{"symbol": "TEST", "title": f"Headline {index}", "url": f"https://example.com/{index}"} for index in range(8)]
+
+    enriched = _attach_article_excerpts(
+        items,
+        {"article_scraping": {"enabled": True, "max_articles_per_symbol": 3}},
+    )
+
+    assert len(calls) == 3
+    assert len(enriched) == 8
+
+
+def test_news_feed_scrapes_ranked_headlines_first(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["context_agent"]["news_analysis"]["article_scraping"]["enabled"] = True
+    raw["context_agent"]["news_analysis"]["article_scraping"]["max_articles_per_symbol"] = 1
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    monkeypatch.setattr(
+        "stockpredictor.news.fetch_news_items",
+        lambda symbols, limit=50, **kwargs: [
+            {"symbol": "TEST", "title": "Old recap", "url": "https://example.com/old", "published": "2026-01-01T09:30:00Z", "impact": 0.0},
+            {"symbol": "TEST", "title": "TEST raises guidance after earnings beat", "url": "https://example.com/fresh", "published": "2099-01-01T09:30:00Z", "impact": 0.8},
+        ],
+    )
+    calls = []
+    monkeypatch.setattr("stockpredictor.news._fetch_article_excerpt", lambda url, **kwargs: calls.append(url) or "excerpt")
+
+    build_news_feed(["TEST"], settings, limit=10)
+
+    assert calls == ["https://example.com/fresh"]
 
 
 def test_extract_article_text_uses_meta_and_paragraphs() -> None:

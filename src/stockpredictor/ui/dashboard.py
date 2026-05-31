@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from dataclasses import asdict
-from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,9 +22,6 @@ from stockpredictor.news import NewsAnalysisError, build_news_feed
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.symbols import normalize_symbol, search_symbols
 from stockpredictor.utils import clean_symbol_list, to_float, to_serializable
-
-
-UI_STATE_PATH = Path("data/dashboard_ui_state.local.json")
 
 
 HELP_TEXT = {
@@ -73,52 +68,55 @@ HELP_TEXT = {
 def _remembered_expander(label: str, state_key: str, expanded: bool = False, container=None):
     container = container or st
     expander_key = f"expander_{_slug_key(state_key)}"
-    panel_state = _load_panel_state()
-    if expander_key not in st.session_state:
-        st.session_state[expander_key] = bool(panel_state.get(state_key, expanded))
     return container.expander(
         label,
-        expanded=bool(st.session_state.get(expander_key, expanded)),
+        expanded=expanded,
         key=expander_key,
-        on_change=_persist_expander_state,
-        args=(state_key, expander_key),
+        on_change="ignore",
     )
 
 
-def _persist_expander_state(state_key: str, expander_key: str) -> None:
-    state = _load_ui_state()
-    panels = state.setdefault("expanders", {})
-    panels[state_key] = bool(st.session_state.get(expander_key, False))
-    _save_ui_state(state)
-
-
-def _load_panel_state() -> dict[str, bool]:
-    state = _load_ui_state()
-    panels = state.get("expanders", {})
-    return panels if isinstance(panels, dict) else {}
-
-
-def _load_ui_state() -> dict:
-    if "dashboard_ui_state" in st.session_state and isinstance(st.session_state.dashboard_ui_state, dict):
-        return st.session_state.dashboard_ui_state
-    if not UI_STATE_PATH.exists():
-        st.session_state.dashboard_ui_state = {"expanders": {}}
-        return st.session_state.dashboard_ui_state
-    try:
-        state = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        state = {"expanders": {}}
-    if not isinstance(state, dict):
-        state = {"expanders": {}}
-    state.setdefault("expanders", {})
-    st.session_state.dashboard_ui_state = state
-    return state
-
-
-def _save_ui_state(state: dict) -> None:
-    UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    UI_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    st.session_state.dashboard_ui_state = state
+def _install_expander_memory() -> None:
+    st.iframe(
+        """
+        <script>
+        (() => {
+          const storageKey = "stockpredictor.expander-state.v2";
+          const doc = window.parent.document;
+          const storage = window.parent.localStorage;
+          const loadState = () => {
+            try { return JSON.parse(storage.getItem(storageKey) || "{}"); }
+            catch (_) { return {}; }
+          };
+          const saveState = (state) => storage.setItem(storageKey, JSON.stringify(state));
+          const bind = () => {
+            const state = loadState();
+            doc.querySelectorAll('[class*="st-key-expander_"]').forEach((wrapper) => {
+              const details = wrapper.matches("details") ? wrapper : wrapper.querySelector("details");
+              if (!details) return;
+              const panelClass = [...wrapper.classList].find((name) => name.startsWith("st-key-expander_"));
+              if (!panelClass) return;
+              if (Object.prototype.hasOwnProperty.call(state, panelClass)) {
+                details.open = Boolean(state[panelClass]);
+              }
+              if (details.dataset.stockpredictorMemoryBound === "true") return;
+              details.dataset.stockpredictorMemoryBound = "true";
+              details.addEventListener("toggle", () => {
+                const latest = loadState();
+                latest[panelClass] = details.open;
+                saveState(latest);
+              });
+            });
+          };
+          bind();
+          new MutationObserver(bind).observe(doc.body, { childList: true, subtree: true });
+        })();
+        </script>
+        """,
+        height=1,
+        width=1,
+        tab_index=-1,
+    )
 
 
 def _slug_key(value: str) -> str:
@@ -162,8 +160,11 @@ def main() -> None:
             step=5,
             help="How many headlines to gather and feed into this symbol's news analysis and the decision. Free providers may return fewer.",
         )
-        if st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon."):
-            _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit)
+        analyze_requested = st.button("Analyze", type="primary", help="Run the full signal, context, risk, and chart analysis for this symbol and horizon.")
+        if analyze_requested:
+            _render_analysis(settings, selected_symbol, horizon=selected_horizon, news_limit=news_limit, refresh=True)
+        elif st.session_state.get("latest_analysis") is not None:
+            _render_analysis(settings, selected_symbol, refresh=False)
     with news_tab:
         _render_news(settings, symbols or settings.watchlist())
     with backtest_tab:
@@ -172,6 +173,7 @@ def main() -> None:
         _render_journal(settings, symbols)
     with config_tab:
         _render_settings_tab(settings, symbols)
+    _install_expander_memory()
 
 
 def _render_scanner(settings, symbols: list[str]) -> None:
@@ -199,28 +201,36 @@ def _render_scanner(settings, symbols: list[str]) -> None:
             progress_callback=update_progress,
         )
         progress.progress(1.0, text="Scanner ready")
-        rows = [_rounded_row(result.scanner_row) for result in results]
-        if not rows:
-            st.info("No symbols selected.")
-            return
-        df = pd.DataFrame(rows)
-        df = _render_scanner_filters(df, settings)
-        if df.empty:
-            st.info("No symbols passed the current scanner filters.")
-            return
-        actionable = int(df["action"].isin(["long", "short", "watch"]).sum()) if "action" in df else 0
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Scanned", len(df), help="Number of rows remaining after filters.")
-        c2.metric("Trade / Watch", actionable, help=HELP_TEXT["trade_watch"])
-        c3.metric("Avg RVOL", f"{df['volume_anomaly'].dropna().mean():.2f}" if "volume_anomaly" in df else "-", help=HELP_TEXT["avg_rvol"])
-        c4.metric("Top Rank", f"{df['rank_score'].max():.3f}" if "rank_score" in df else "-", help=HELP_TEXT["rank"])
-        st.dataframe(
-            _scanner_summary_df(df),
-            use_container_width=True,
-            hide_index=True,
-            column_config=_scanner_column_config(compact=True),
-        )
-        _render_scanner_detail(df)
+        st.session_state.latest_scan_results = results
+        st.session_state.latest_scan_symbols = [result.snapshot.symbol for result in results]
+    results = st.session_state.get("latest_scan_results")
+    if results is None:
+        return
+    scanned_symbols = st.session_state.get("latest_scan_symbols", [])
+    if scanned_symbols:
+        st.caption(f"Showing last scan: {', '.join(scanned_symbols)}")
+    rows = [_rounded_row(result.scanner_row) for result in results]
+    if not rows:
+        st.info("No symbols selected.")
+        return
+    df = pd.DataFrame(rows)
+    df = _render_scanner_filters(df, settings)
+    if df.empty:
+        st.info("No symbols passed the current scanner filters.")
+        return
+    actionable = int(df["action"].isin(["long", "short", "watch"]).sum()) if "action" in df else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Scanned", len(df), help="Number of rows remaining after filters.")
+    c2.metric("Trade / Watch", actionable, help=HELP_TEXT["trade_watch"])
+    c3.metric("Avg RVOL", f"{df['volume_anomaly'].dropna().mean():.2f}" if "volume_anomaly" in df else "-", help=HELP_TEXT["avg_rvol"])
+    c4.metric("Top Rank", f"{df['rank_score'].max():.3f}" if "rank_score" in df else "-", help=HELP_TEXT["rank"])
+    st.dataframe(
+        _scanner_summary_df(df),
+        width="stretch",
+        hide_index=True,
+        column_config=_scanner_column_config(compact=True),
+    )
+    _render_scanner_detail(df)
 
 
 def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
@@ -325,7 +335,7 @@ def _render_scanner_detail(df: pd.DataFrame) -> None:
         ]
         if rows:
             with _remembered_expander(group, f"scanner_detail_{_slug_key(group)}", expanded=(group == "Trade Setup")):
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _scanner_detail_label(row: dict) -> str:
@@ -336,14 +346,23 @@ def _scanner_detail_label(row: dict) -> str:
     return f"{symbol} | {action} | rank {rank} | {reason}"
 
 
-def _render_analysis(settings, symbol: str, horizon: str | None = None, news_limit: int | None = None) -> None:
-    progress = st.progress(0, text=f"Starting {symbol} analysis")
-    progress.progress(0.15, text=f"Running signal, context, and risk checks for {symbol}")
-    result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit)
-    progress.progress(0.75, text=f"Loading chart history for {symbol}")
-    provider = get_market_data_provider(settings)
-    frame = fetch_market_data(symbol, settings, provider)
-    progress.progress(1.0, text=f"{symbol} analysis ready")
+def _render_analysis(settings, symbol: str, horizon: str | None = None, news_limit: int | None = None, refresh: bool = True) -> None:
+    if refresh:
+        progress = st.progress(0, text=f"Starting {symbol} analysis")
+        progress.progress(0.15, text=f"Running signal, context, and risk checks for {symbol}")
+        result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit)
+        progress.progress(0.75, text=f"Loading chart history for {symbol}")
+        provider = get_market_data_provider(settings)
+        frame = fetch_market_data(symbol, settings, provider)
+        progress.progress(1.0, text=f"{symbol} analysis ready")
+        st.session_state.latest_analysis = {"result": result, "frame": frame}
+    else:
+        latest = st.session_state.get("latest_analysis")
+        if latest is None:
+            return
+        result = latest["result"]
+        frame = latest["frame"]
+    st.caption(f"Showing last completed analysis: {result.snapshot.symbol} ({result.horizon})")
 
     session = result.session
     live_price = session.live_price if session is not None else None
@@ -427,14 +446,14 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     st.subheader("Chart And Levels")
     st.plotly_chart(
         _price_chart(frame, result.features.levels, result.risk_plan, ma_windows=settings.features.get("ma_windows", [9, 20, 50])),
-        use_container_width=True,
+        width="stretch",
     )
 
     _render_context_panel(result)
 
     with _remembered_expander("Model Details", "analysis_model_details", expanded=False):
         model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
-        st.dataframe(model_df, use_container_width=True, hide_index=True, column_config=_model_column_config())
+        st.dataframe(model_df, width="stretch", hide_index=True, column_config=_model_column_config())
 
     with _remembered_expander("Full Signal / Risk Data", "analysis_full_signal_risk", expanded=False):
         st.dataframe(
@@ -449,7 +468,7 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
                     }
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "confidence": st.column_config.NumberColumn("Confidence", format="%.1f%%"),
@@ -458,7 +477,7 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
         )
         st.dataframe(
             pd.DataFrame([_risk_plan_row(result.risk_plan)]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config=_risk_column_config(),
         )
@@ -468,7 +487,7 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
             pd.DataFrame(
                 _indicator_rows(to_serializable(result.features.indicators))
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -498,7 +517,7 @@ def _render_trade_plan_summary(result) -> None:
         {"field": "Target", "value": _format_targets(plan.targets)},
         {"field": "Invalidation", "value": plan.invalidation or "-"},
     ]
-    st.dataframe(pd.DataFrame(levels), use_container_width=True, hide_index=True, column_config=_trade_plan_column_config())
+    st.dataframe(pd.DataFrame(levels), width="stretch", hide_index=True, column_config=_trade_plan_column_config())
     st.caption(f"Primary reason: {decision.top_reason or '-'}")
     if plan.no_trade_reasons:
         st.warning("No-trade reasons: " + "; ".join(plan.no_trade_reasons))
@@ -563,6 +582,7 @@ def _render_why_not_actionable(result, settings) -> None:
     risk_cfg = settings.risk
     watch_score = float(thresholds.get("watch_score", 0.18))
     long_score = float(thresholds.get("long_score", 0.35))
+    short_score = float(thresholds.get("short_score", -0.35))
     required_conf = max(float(thresholds.get("min_confidence", 0.30)), float(risk_cfg.get("min_confidence_for_trade", 0.40)))
 
     blockers: list[str] = []
@@ -571,7 +591,7 @@ def _render_why_not_actionable(result, settings) -> None:
     if abs(decision.score) < watch_score:
         blockers.append(
             f"Signal too weak — score {decision.score:+.3f} is inside the no-trade zone "
-            f"(needs ±{watch_score:.2f} to watch, ±{long_score:.2f} to trade)."
+            f"(needs ±{watch_score:.2f} to watch, +{long_score:.2f} long or {short_score:.2f} short to trade)."
         )
     if decision.confidence < required_conf:
         blockers.append(f"Confidence {decision.confidence:.0%} is below the required {required_conf:.0%}.")
@@ -644,7 +664,7 @@ def _render_news_decision_panel(result) -> None:
                     {"question": "No-trade flags", "answer": "; ".join(focus.get("no_trade_flags", [])) or "-"},
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "question": st.column_config.TextColumn("Question", help="Trader question the news summary answers."),
@@ -663,7 +683,7 @@ def _render_news_decision_panel(result) -> None:
         with _remembered_expander(f"Headlines used in this decision ({len(evidence)})", f"decision_news_evidence_{result.snapshot.symbol}", expanded=False):
             ev_df = pd.DataFrame(evidence)
             columns = [column for column in ["provider", "published", "category", "sentiment", "impact", "day_trader_relevance", "freshness", "title", "url"] if column in ev_df.columns]
-            st.dataframe(ev_df[columns], use_container_width=True, hide_index=True, column_config=_headline_column_config())
+            st.dataframe(ev_df[columns], width="stretch", hide_index=True, column_config=_headline_column_config())
 
 
 def _render_score_attribution(decision) -> None:
@@ -698,7 +718,7 @@ def _render_score_attribution(decision) -> None:
         )
         st.dataframe(
             pd.DataFrame(rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "input": st.column_config.TextColumn("Input", help="Signal component or penalty applied to the fused score."),
@@ -730,7 +750,7 @@ def _render_context_panel(result) -> None:
             **result.context.features,
         }
         context_metrics = _percent_context_metrics(context_metrics)
-        st.dataframe(pd.DataFrame([context_metrics]), use_container_width=True, hide_index=True, column_config=_context_column_config())
+        st.dataframe(pd.DataFrame([context_metrics]), width="stretch", hide_index=True, column_config=_context_column_config())
         if result.context.catalysts:
             st.write("Catalysts")
             st.write(result.context.catalysts)
@@ -872,7 +892,7 @@ def _indicator_rows(indicators: dict) -> list[dict[str, str]]:
             display = "-"
         elif key in percent_keys:
             display = _format_percent(float(value))
-        elif key in price_keys:
+        elif key in price_keys or key.startswith("sma_"):
             display = _format_price(float(value))
         elif isinstance(value, float):
             display = f"{value:,.3f}"
@@ -956,9 +976,7 @@ def _render_symbol_sidebar(settings) -> list[str]:
         if st.sidebar.button("Add selected symbol", help="Append the selected search result to the symbol list."):
             _append_symbol_to_state(selected_lookup.split(" - ", 1)[0])
     elif lookup_query:
-        direct = normalize_symbol(lookup_query)
-        if st.sidebar.button(f"Add {direct}", help="Add this direct ticker even if it was not found in the local search index."):
-            _append_symbol_to_state(direct)
+        st.sidebar.caption("No matching company or valid ticker found.")
 
     st.sidebar.text_area(
         "Selected symbols",
@@ -998,47 +1016,55 @@ def _render_news(settings, symbols: list[str]) -> None:
             st.info("Start LocalDeploy on the configured endpoint or enable llm.fallback_to_heuristic in the config.")
             return
         progress.progress(1.0, text="News feed ready")
-        items = feed["headlines"]
-        if not items:
-            st.info("No recent headlines returned by the configured free provider.")
-            return
-        df = pd.DataFrame(items)
-        requested = int(feed.get("requested_headline_limit", headline_limit))
-        returned = int(feed.get("returned_headline_count", len(df)))
-        bullish = int((df["sentiment"] == "bullish").sum()) if "sentiment" in df else 0
-        bearish = int((df["sentiment"] == "bearish").sum()) if "sentiment" in df else 0
-        neutral = len(df) - bullish - bearish
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Headlines", f"{returned}/{requested}", help="Returned headlines versus the amount requested by the slider.")
-        c2.metric("Bullish", bullish, help="Headlines classified as directionally positive.")
-        c3.metric("Bearish", bearish, help="Headlines classified as directionally negative.")
-        c4.metric("Neutral", neutral, help="Headlines without a clear directional tilt.")
-        c5.metric("Analysis", feed["analysis_provider"], help=HELP_TEXT["analysis_provider"])
-        _render_news_coverage(feed.get("coverage", {}))
-        if returned < requested:
-            st.info(
-                f"Requested {requested} headlines and received {returned}. "
-                "That usually means the configured free sources did not expose more recent linked items for the selected symbols."
-            )
-        provider_label = str(feed.get("analysis_provider", ""))
-        if "heuristic_fallback" in provider_label:
-            st.warning("LLM summarization failed; this feed is using heuristic fallback summaries.")
-        elif "llm_error" in provider_label:
-            st.warning("One or more symbol summaries failed LLM parsing. The affected symbol keeps its source links for manual review.")
-        elif provider_label == "heuristic":
-            st.info("LLM summarization is disabled; this feed is using heuristic summaries.")
+        st.session_state.latest_news_feed = feed
+    feed = st.session_state.get("latest_news_feed")
+    if feed is not None:
+        _render_news_feed(feed, headline_limit)
 
-        st.subheader("Stock News Summary")
-        for summary in feed["summaries"]:
-            _render_symbol_news_summary(summary)
 
-        st.subheader("Headline Table")
-        st.dataframe(
-            df[["symbol", "category", "sentiment", "impact", "day_trader_relevance", "published", "provider", "title", "url"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config=_headline_column_config(),
+def _render_news_feed(feed: dict, headline_limit: int) -> None:
+    items = feed["headlines"]
+    if not items:
+        st.info("No recent headlines returned by the configured free provider.")
+        return
+    st.caption(f"Showing last completed news aggregation: {', '.join(feed.get('symbols', [])) or '-'}")
+    df = pd.DataFrame(items)
+    requested = int(feed.get("requested_headline_limit", headline_limit))
+    returned = int(feed.get("returned_headline_count", len(df)))
+    bullish = int((df["sentiment"] == "bullish").sum()) if "sentiment" in df else 0
+    bearish = int((df["sentiment"] == "bearish").sum()) if "sentiment" in df else 0
+    neutral = len(df) - bullish - bearish
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Headlines", f"{returned}/{requested}", help="Returned headlines versus the amount requested by the slider.")
+    c2.metric("Bullish", bullish, help="Headlines classified as directionally positive.")
+    c3.metric("Bearish", bearish, help="Headlines classified as directionally negative.")
+    c4.metric("Neutral", neutral, help="Headlines without a clear directional tilt.")
+    c5.metric("Analysis", feed["analysis_provider"], help=HELP_TEXT["analysis_provider"])
+    _render_news_coverage(feed.get("coverage", {}))
+    if returned < requested:
+        st.info(
+            f"Requested {requested} headlines and received {returned}. "
+            "That usually means the configured free sources did not expose more recent linked items for the selected symbols."
         )
+    provider_label = str(feed.get("analysis_provider", ""))
+    if "heuristic_fallback" in provider_label:
+        st.warning("LLM summarization failed; this feed is using heuristic fallback summaries.")
+    elif "llm_error" in provider_label:
+        st.warning("One or more symbol summaries failed LLM parsing. The affected symbol keeps its source links for manual review.")
+    elif provider_label == "heuristic":
+        st.info("LLM summarization is disabled; this feed is using heuristic summaries.")
+
+    st.subheader("Stock News Summary")
+    for summary in feed["summaries"]:
+        _render_symbol_news_summary(summary)
+
+    st.subheader("Headline Table")
+    st.dataframe(
+        df[["symbol", "category", "sentiment", "impact", "day_trader_relevance", "published", "provider", "title", "url"]],
+        width="stretch",
+        hide_index=True,
+        column_config=_headline_column_config(),
+    )
 
 
 def _render_backtest(settings, symbols: list[str]) -> None:
@@ -1056,7 +1082,7 @@ def _render_backtest(settings, symbols: list[str]) -> None:
                     {"field": "Commission", "value": _format_price(float(settings.backtest.get("commission_per_trade", 0)))},
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
     )
     if st.button("Run Backtest On Selected Symbols", type="primary", help="Run historical simulation using the selected symbols and current config. Treat results as a logic check, not proof of future edge."):
@@ -1065,24 +1091,35 @@ def _render_backtest(settings, symbols: list[str]) -> None:
         with st.spinner("Running historical simulation"):
             report = run_backtest(settings, symbols=symbols or None)
         progress.progress(1.0, text="Backtest ready")
-        report_df = pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"])
-        report_df = _percent_display(report_df, ["win_rate", "average_return", "max_drawdown", "no_trade_rate"])
-        st.dataframe(
-            report_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config=_backtest_column_config(),
-        )
-        if report.equity_curve:
-            equity_df = pd.DataFrame(report.equity_curve)
-            st.line_chart(equity_df.set_index("date")["equity"])
-        if report.trade_log:
-            with _remembered_expander("Trade Log", "backtest_trade_log", expanded=True):
-                trade_log_df = _percent_display(
-                    pd.DataFrame(report.trade_log),
-                    ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
-                )
-                st.dataframe(trade_log_df, use_container_width=True, hide_index=True, column_config=_trade_log_column_config())
+        st.session_state.latest_backtest_report = report
+        st.session_state.latest_backtest_symbols = selected_symbols
+    report = st.session_state.get("latest_backtest_report")
+    if report is not None:
+        completed_symbols = st.session_state.get("latest_backtest_symbols", [])
+        if completed_symbols:
+            st.caption(f"Showing last completed backtest: {', '.join(completed_symbols)}")
+        _render_backtest_report(report)
+
+
+def _render_backtest_report(report) -> None:
+    report_df = pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"])
+    report_df = _percent_display(report_df, ["win_rate", "average_return", "max_drawdown", "no_trade_rate"])
+    st.dataframe(
+        report_df,
+        width="stretch",
+        hide_index=True,
+        column_config=_backtest_column_config(),
+    )
+    if report.equity_curve:
+        equity_df = pd.DataFrame(report.equity_curve)
+        st.line_chart(equity_df.set_index("date")["equity"])
+    if report.trade_log:
+        with _remembered_expander("Trade Log", "backtest_trade_log", expanded=True):
+            trade_log_df = _percent_display(
+                pd.DataFrame(report.trade_log),
+                ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
+            )
+            st.dataframe(trade_log_df, width="stretch", hide_index=True, column_config=_trade_log_column_config())
 
 
 def _render_settings_tab(settings, symbols: list[str]) -> None:
@@ -1101,7 +1138,7 @@ def _render_settings_tab(settings, symbols: list[str]) -> None:
         {"section": "Min risk/reward", "value": str(settings.risk.get("min_risk_reward", "-"))},
         {"section": "Selected symbols", "value": ", ".join(symbols) or "-"},
     ]
-    st.dataframe(pd.DataFrame(sections), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(sections), width="stretch", hide_index=True)
 
     with _remembered_expander("Advanced Raw Config", "settings_raw_config", expanded=False):
         st.json(to_serializable(settings.raw))
@@ -1126,6 +1163,7 @@ def _render_news_capability_note(settings) -> None:
             "This feed aggregates configured headline metadata and provider links. "
             "When article scraping is enabled, it fetches a short article excerpt for the LLM; it does not store full article bodies."
         )
+        st.write("Headline-row category, sentiment, impact, and relevance fields use the built-in keyword classifier. The configured LLM produces the per-symbol summary.")
         st.write(f"Configured sources: {sources}. LLM summarizer: {llm_status} ({provider}). Heuristic fallback: {fallback}. Article excerpts: {scraping}.")
         st.write("If fallback is disabled and the configured LLM endpoint is unavailable, the News tab stops instead of producing a heuristic summary.")
 
@@ -1145,7 +1183,7 @@ def _render_news_coverage(coverage: dict) -> None:
         with _remembered_expander("Source counts", "news_source_counts", expanded=False):
             st.dataframe(
                 pd.DataFrame([{"source": source, "headlines": count} for source, count in sorted(source_counts.items())]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1170,7 +1208,7 @@ def _render_symbol_news_summary(summary: dict) -> None:
                 {"question": "No-trade flags", "answer": "; ".join(focus.get("no_trade_flags", [])) or "-"},
             ]
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "question": st.column_config.TextColumn("Question", help="Trader question the news summary is trying to answer."),
@@ -1195,7 +1233,7 @@ def _render_symbol_news_summary(summary: dict) -> None:
             columns = [column for column in ["provider", "published", "category", "sentiment", "impact", "title", "url"] if column in sources.columns]
             st.dataframe(
                 sources[columns],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config=_headline_column_config(),
             )
@@ -1259,7 +1297,7 @@ def _render_journal(settings, symbols: list[str]) -> None:
         recent = load_journal_entries(settings, limit=100)
     if recent:
         df = pd.DataFrame(recent)
-        st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(df.sort_values("timestamp", ascending=False), width="stretch", hide_index=True)
         _render_journal_edit_controls(settings, recent)
     else:
         st.info("No journal entries yet.")

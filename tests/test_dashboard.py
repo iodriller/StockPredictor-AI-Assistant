@@ -1,8 +1,20 @@
 from __future__ import annotations
 
-import pandas as pd
+from pathlib import Path
 
-from stockpredictor.ui.dashboard import HELP_TEXT, _indicator_rows, _price_chart, _scanner_summary_df
+import pandas as pd
+from streamlit.testing.v1 import AppTest
+
+from stockpredictor.ui.dashboard import HELP_TEXT, _indicator_rows, _price_chart, _remembered_expander, _scanner_summary_df
+
+
+def test_dashboard_initial_render_has_no_runtime_exception() -> None:
+    dashboard = Path(__file__).parents[1] / "src" / "stockpredictor" / "ui" / "dashboard.py"
+
+    app = AppTest.from_file(str(dashboard), default_timeout=30).run()
+
+    assert not app.exception
+    assert [tab.label for tab in app.tabs] == ["Scanner", "Trade Plan", "News", "Backtest", "Journal", "Settings"]
 
 
 def test_price_chart_uses_configured_ma_windows_and_result_levels() -> None:
@@ -84,6 +96,7 @@ def test_indicator_rows_use_readable_labels() -> None:
     rows = _indicator_rows(
         {
             "price_change_pct": 0.0123,
+            "sma_3": 99.125,
             "sma_20": 101.25,
             "volume_anomaly": 2.4,
             "opening_range_status": "available",
@@ -93,6 +106,7 @@ def test_indicator_rows_use_readable_labels() -> None:
     labels = {row["name"]: row["value"] for row in rows}
 
     assert labels["Price Change"] == "1.23%"
+    assert labels["SMA 3"] == "$99.12"
     assert labels["SMA 20"] == "$101.25"
     assert labels["Relative Volume"] == "2.400"
     assert labels["Opening Range Status"] == "available"
@@ -114,3 +128,21 @@ def test_help_text_covers_decision_critical_terms() -> None:
 
     assert required.issubset(HELP_TEXT)
     assert all(HELP_TEXT[key] for key in required)
+
+
+def test_remembered_expander_uses_non_rerunning_mode() -> None:
+    captured = {}
+
+    class Container:
+        def expander(self, label, **kwargs):
+            captured["label"] = label
+            captured.update(kwargs)
+            return "panel"
+
+    panel = _remembered_expander("Details", "scanner_details", expanded=True, container=Container())
+
+    assert panel == "panel"
+    assert captured["label"] == "Details"
+    assert captured["expanded"] is True
+    assert captured["key"] == "expander_scanner_details"
+    assert captured["on_change"] == "ignore"

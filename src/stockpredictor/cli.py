@@ -24,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dashboard_parser = subparsers.add_parser("dashboard", parents=[common], help="Run the Streamlit dashboard.")
     dashboard_parser.add_argument("--server-port", type=int, default=8501)
+    dashboard_parser.add_argument("--host", default="127.0.0.1")
 
     analyze_parser = subparsers.add_parser("analyze", parents=[common], help="Analyze one symbol.")
     analyze_parser.add_argument("symbol")
@@ -56,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
             str(dashboard_path),
             "--server.port",
             str(args.server_port),
+            "--server.address",
+            args.host,
             "--server.headless",
             "true",
             "--browser.gatherUsageStats",

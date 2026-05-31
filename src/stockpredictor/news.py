@@ -48,18 +48,11 @@ def build_news_feed(symbols: list[str], settings: Settings, limit: int = 50, pro
     all_items = fetch_news_items(clean_symbols, limit=max(requested_limit, len(clean_symbols) * summary_limit), sources=headline_sources, source_config=cfg)
     _notify_progress(progress_callback, 0.40, f"Fetched {len(all_items)} headline item(s)")
     enriched = [_enrich_item(item) for item in all_items]
-    _notify_progress(progress_callback, 0.55, "Classified headline sentiment, category, impact, and freshness")
-    enriched = _attach_article_excerpts(enriched, cfg, progress_callback)
+    _notify_progress(progress_callback, 0.55, "Applied keyword-based headline sentiment, category, impact, and freshness classification")
     # Prioritize fresh, relevant items so the dashboard's top row is the most
-    # actionable headline, not just the first one the provider returned.
-    enriched.sort(
-        key=lambda item: (
-            float(item.get("freshness", 0.0)) * float(item.get("day_trader_relevance", 0.0)),
-            float(item.get("freshness", 0.0)),
-            abs(float(item.get("impact", 0.0))),
-        ),
-        reverse=True,
-    )
+    # actionable headline and the limited scrape budget is spent on useful rows.
+    enriched = _sort_news_items(enriched)
+    enriched = _attach_article_excerpts(enriched, cfg, progress_callback)
     fresh_threshold = float(cfg.get("fresh_window_minutes", 60))
     fresh_catalyst_count = sum(
         1 for item in enriched if (item.get("age_minutes") is not None and float(item["age_minutes"]) <= fresh_threshold and abs(float(item.get("impact", 0.0))) >= 0.15)
@@ -114,8 +107,20 @@ def analyze_symbol_news(symbol: str, settings: Settings, limit: int | None = Non
     headline_sources = _configured_headline_sources(settings)
     all_items = fetch_news_items([symbol], limit=summary_limit, sources=headline_sources, source_config=cfg)
     enriched = [_enrich_item(item) for item in all_items if str(item.get("symbol", "")).upper() == symbol or not item.get("symbol")]
+    enriched = _sort_news_items(enriched)
     enriched = _attach_article_excerpts(enriched, cfg)
-    enriched.sort(
+
+    clipped = enriched[:summary_limit]
+    try:
+        summary = _summarize_symbol_news(symbol, clipped, settings)
+    except NewsAnalysisError as exc:
+        summary = _llm_error_symbol_summary(symbol, clipped, str(exc))
+    return {"symbol": symbol, "summary": summary, "headlines": clipped}
+
+
+def _sort_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        items,
         key=lambda item: (
             float(item.get("freshness", 0.0)) * float(item.get("day_trader_relevance", 0.0)),
             float(item.get("freshness", 0.0)),
@@ -123,12 +128,6 @@ def analyze_symbol_news(symbol: str, settings: Settings, limit: int | None = Non
         ),
         reverse=True,
     )
-    clipped = enriched[:summary_limit]
-    try:
-        summary = _summarize_symbol_news(symbol, clipped, settings)
-    except NewsAnalysisError as exc:
-        summary = _llm_error_symbol_summary(symbol, clipped, str(exc))
-    return {"symbol": symbol, "summary": summary, "headlines": clipped}
 
 
 def _summarize_symbol_news(symbol: str, items: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
@@ -385,7 +384,7 @@ def _attach_article_excerpts(items: list[dict[str, Any]], cfg: dict[str, Any], p
     timeout_seconds = float(scrape_cfg.get("timeout_seconds", 8))
     max_chars = int(scrape_cfg.get("max_chars_per_article", 1400))
     user_agent = str(scrape_cfg.get("user_agent", "StockPredictor research crawler/0.1"))
-    counts: dict[str, int] = {}
+    attempts: dict[str, int] = {}
     output = []
     candidates = [item for item in items if item.get("url")]
     _notify_progress(progress_callback, 0.60, f"Fetching up to {max_articles_per_symbol} article page(s) per symbol")
@@ -393,13 +392,13 @@ def _attach_article_excerpts(items: list[dict[str, Any]], cfg: dict[str, Any], p
         enriched_item = dict(item)
         symbol = str(item.get("symbol", "")).upper()
         url = str(item.get("url", "") or "")
-        if url and counts.get(symbol, 0) < max_articles_per_symbol:
+        if url and attempts.get(symbol, 0) < max_articles_per_symbol:
+            attempts[symbol] = attempts.get(symbol, 0) + 1
             try:
                 excerpt = _fetch_article_excerpt(url, timeout_seconds=timeout_seconds, max_chars=max_chars, user_agent=user_agent)
                 if excerpt:
                     enriched_item["article_excerpt"] = excerpt
                     enriched_item["article_fetched"] = True
-                    counts[symbol] = counts.get(symbol, 0) + 1
                 else:
                     enriched_item["article_fetched"] = False
                     enriched_item["article_error"] = "no extractable article text"

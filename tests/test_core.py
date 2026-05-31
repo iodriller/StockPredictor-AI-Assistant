@@ -16,7 +16,7 @@ from stockpredictor.features import build_feature_set
 from stockpredictor.journal import append_journal_entry, load_journal_entries
 from stockpredictor.models import run_models
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
-from stockpredictor.risk import apply_risk_controls
+from stockpredictor.risk import _merge_structural_target, apply_risk_controls
 from stockpredictor.signals import fuse_signals
 
 
@@ -362,6 +362,11 @@ def test_risk_plan_surfaces_stop_and_target_source(tmp_path: Path) -> None:
     assert plan.target_source in {"r_multiple", "structural_resistance"}
 
 
+def test_structural_target_must_be_on_reward_side_of_entry() -> None:
+    assert _merge_structural_target(115.0, 95.0, 100.0, long=True) == ([115.0], "r_multiple")
+    assert _merge_structural_target(85.0, 105.0, 100.0, long=False) == ([85.0], "r_multiple")
+
+
 def test_risk_long_stop_has_fallback_when_structural_levels_missing(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path)
     frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
@@ -458,6 +463,30 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert "setup_quality" in report.trade_log[0]
 
 
+def test_synthetic_analysis_skips_live_market_enrichment(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    provider = SyntheticProvider()
+    monkeypatch.setattr("stockpredictor.market._yfinance_sector", lambda symbol: (_ for _ in ()).throw(AssertionError("live sector lookup called")))
+    monkeypatch.setattr("stockpredictor.calendar._next_earnings_date", lambda symbol: (_ for _ in ()).throw(AssertionError("live earnings lookup called")))
+
+    result = analyze_symbol("TEST", settings, provider=provider, include_context=False)
+
+    assert result.snapshot.provider == "synthetic"
+
+
+def test_disabled_context_agent_skips_rich_news_analysis(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["context_agent"]["enabled"] = False
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    monkeypatch.setattr("stockpredictor.pipeline.analyze_symbol_news", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rich news analysis called")))
+
+    result = analyze_symbol("TEST", settings, provider=SyntheticProvider())
+
+    assert result.context.enabled is False
+
+
 def test_scan_symbols_does_not_apply_dashboard_cap(tmp_path: Path, monkeypatch) -> None:
     settings = _test_settings(tmp_path, enabled_models=["baseline"])
     symbols = [f"TST{index}" for index in range(12)]
@@ -475,6 +504,27 @@ def test_scan_symbols_does_not_apply_dashboard_cap(tmp_path: Path, monkeypatch) 
 
     assert len(scan_symbols(settings, symbols=symbols)) == len(symbols)
     assert len(scan_symbols(settings, symbols=symbols, max_symbols=2)) == 2
+
+
+def test_scan_symbols_skips_expensive_news_analysis(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    calls = []
+
+    class Result:
+        def __init__(self, symbol: str) -> None:
+            self.decision = SignalDecision(symbol=symbol, action="low_confidence", confidence=0.1, score=0.0, timeframe="1d")
+            self.scanner_row = {"rank_score": 0.0}
+
+    def fake_analyze(symbol, **kwargs):
+        calls.append(kwargs)
+        return Result(symbol)
+
+    monkeypatch.setattr("stockpredictor.pipeline.analyze_symbol", fake_analyze)
+
+    scan_symbols(settings, symbols=["AAA", "BBB"])
+
+    assert calls
+    assert all(call["include_news_analysis"] is False for call in calls)
 
 
 def test_fallback_provider_logs_primary_failure(caplog) -> None:
@@ -631,6 +681,11 @@ def test_news_freshness_promotes_recent_items(tmp_path: Path, monkeypatch) -> No
     from stockpredictor.news import build_news_feed
 
     settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["context_agent"]["news_analysis"]["llm"]["enabled"] = False
+    raw["context_agent"]["news_analysis"]["article_scraping"]["enabled"] = False
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
     now = datetime.now(timezone.utc)
     fresh = (now - timedelta(minutes=5)).isoformat()
     stale = (now - timedelta(hours=12)).isoformat()
