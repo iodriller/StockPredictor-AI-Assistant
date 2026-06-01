@@ -57,8 +57,10 @@ def fuse_signals(
         reasons.append("context has risk input")
     reasons.extend(context.reasons_to_trade[:2])
     reasons.extend(context.reasons_to_skip[:2])
-    if disagreement:
-        penalty = float(thresholds.get("disagreement_penalty", 0.18))
+    model_weight = float(weights.get("models", 0.0))
+    disagreement_influence = model_weight if disagreement else 0.0
+    if disagreement_influence > 0:
+        penalty = float(thresholds.get("disagreement_penalty", 0.18)) * disagreement_influence
         score = _record_penalty(score, 1 - penalty, "model disagreement", score_breakdown)
         reasons.append("model disagreement reduced confidence")
 
@@ -83,14 +85,14 @@ def fuse_signals(
         score = _record_penalty(score, 1 - news_penalty, f"news no-trade flags ({news_flag_count})", score_breakdown)
         reasons.append("news no-trade flags reduced confidence")
 
-    component_confidence = _average([prediction.confidence for prediction in predictions if prediction.confidence > 0])
+    component_confidence = _component_confidence(predictions, context, weights)
     # Confidence weighting is config-driven so the no-trade calibration can be tuned
     # without code changes. Defaults preserve the original behavior.
     score_weight = float(thresholds.get("confidence_score_weight", 0.75))
     component_weight = float(thresholds.get("confidence_component_weight", 0.35))
     disagreement_conf_penalty = float(thresholds.get("disagreement_confidence_penalty", 0.12))
     confidence = clamp(
-        abs(score) * score_weight + component_confidence * component_weight - (disagreement_conf_penalty if disagreement else 0),
+        abs(score) * score_weight + component_confidence * component_weight - disagreement_conf_penalty * disagreement_influence,
         0.0,
         1.0,
     )
@@ -173,13 +175,36 @@ def _model_component(predictions: list[ModelPrediction], settings: Settings) -> 
     return (_average(valid_scores), scores, disagreement)
 
 
+def _component_confidence(
+    predictions: list[ModelPrediction],
+    context: ContextSummary,
+    weights: dict[str, float],
+) -> float:
+    weighted: list[tuple[float, float]] = []
+    model_weight = float(weights.get("models", 0.0))
+    if model_weight > 0:
+        model_confidence = _average([prediction.confidence for prediction in predictions if prediction.confidence > 0])
+        weighted.append((model_weight, model_confidence))
+
+    ai_weight = float(weights.get("context", 0.0)) + float(weights.get("sentiment", 0.0))
+    if ai_weight > 0:
+        stance_confidence = abs(float(context.features.get("news_stance_score", 0.0) or 0.0))
+        context_confidence = float(context.features.get("context_confidence", 0.0) or 0.0)
+        ai_confidence = max(stance_confidence, context_confidence * abs(context.score))
+        if ai_confidence > 0:
+            weighted.append((ai_weight, ai_confidence))
+
+    total_weight = sum(weight for weight, _ in weighted)
+    return sum(weight * confidence for weight, confidence in weighted) / total_weight if total_weight else 0.0
+
+
 def _action_from_score(score: float, confidence: float, thresholds: dict[str, float]) -> str:
     min_confidence = float(thresholds.get("min_confidence", 0.35))
     if confidence < min_confidence:
         return "low_confidence"
-    if score >= float(thresholds.get("long_score", 0.35)):
+    if score >= float(thresholds.get("long_score", 0.30)):
         return "long"
-    if score <= float(thresholds.get("short_score", -0.35)):
+    if score <= float(thresholds.get("short_score", -0.30)):
         return "short"
     if abs(score) >= float(thresholds.get("watch_score", 0.18)):
         return "watch"

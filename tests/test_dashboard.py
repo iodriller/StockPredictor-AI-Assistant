@@ -3,9 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from streamlit.testing.v1 import AppTest
 
-from stockpredictor.ui.dashboard import HELP_TEXT, _indicator_rows, _price_chart, _remembered_expander, _scanner_summary_df
+from stockpredictor.ui.dashboard import (
+    HELP_TEXT,
+    _action_presentation,
+    _indicator_rows,
+    _price_chart,
+    _remembered_expander,
+    _scanner_summary_df,
+    _trust_balanced_weights,
+)
 
 
 def test_dashboard_initial_render_has_no_runtime_exception() -> None:
@@ -156,3 +165,20 @@ def test_remembered_expander_uses_non_rerunning_mode() -> None:
     assert captured["expanded"] is True
     assert captured["key"] == "expander_scanner_details"
     assert captured["on_change"] == "ignore"
+
+
+def test_trust_balance_scales_price_side_to_zero_at_full_ai_trust() -> None:
+    base = {"models": 0.35, "technicals": 0.30, "intraday": 0.10, "context": 0.20, "sentiment": 0.05}
+
+    original = _trust_balanced_weights(base, 25)
+    ai_only = _trust_balanced_weights(base, 100)
+
+    assert original == pytest.approx(base)
+    assert ai_only == pytest.approx({"models": 0.0, "technicals": 0.0, "intraday": 0.0, "context": 0.8, "sentiment": 0.2})
+
+
+def test_action_presentation_explains_no_trade() -> None:
+    label, meaning = _action_presentation("no_trade")
+
+    assert "NO TRADE" in label
+    assert "Sitting out" in meaning

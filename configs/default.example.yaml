@@ -89,8 +89,8 @@ signal_fusion:
     context: 0.20
     sentiment: 0.05
   thresholds:
-    long_score: 0.35
-    short_score: -0.35
+    long_score: 0.30
+    short_score: -0.30
     watch_score: 0.18
     min_confidence: 0.30
     disagreement_penalty: 0.18
@@ -105,10 +105,10 @@ risk:
   account_size: 100000
   max_risk_per_trade_pct: 0.01
   max_position_fraction: 0.20
-  min_risk_reward: 1.5
+  min_risk_reward: 1.25
   atr_stop_multiple: 1.5
   target_r_multiple: 1.5
-  min_confidence_for_trade: 0.40
+  min_confidence_for_trade: 0.35
   skip_if_atr_pct_above: 0.12
   min_avg_volume: 500000
   max_entry_distance_from_vwap_pct: 0.08

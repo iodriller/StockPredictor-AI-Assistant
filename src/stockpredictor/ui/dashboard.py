@@ -107,6 +107,14 @@ class _EducationalHelp:
 
 HELP_TEXT = _EducationalHelp(_HELP_BASE)
 
+_ACTION_PRESENTATION = {
+    "long": ("🟢 LONG", "Bullish setup passed the signal gates. Review the entry, stop, target, and invalidation before acting."),
+    "short": ("🔴 SHORT", "Bearish setup passed the signal gates. Review borrow availability, entry, stop, target, and invalidation before acting."),
+    "watch": ("🔵 WATCH", "There is a directional edge, but it has not cleared the trade threshold. Keep it on the screen and wait for confirmation."),
+    "low_confidence": ("🟡 LOW CONFIDENCE", "The inputs are mixed or weak. Do not trade until confidence improves."),
+    "no_trade": ("⚪ NO TRADE", "The current setup does not justify a new position. Sitting out is the decision."),
+}
+
 
 def _remembered_expander(label: str, state_key: str, expanded: bool = False, container=None):
     container = container or st
@@ -404,15 +412,12 @@ def _render_tuning_controls(settings, horizon: str) -> "Settings":
 def _render_trust_and_thresholds(settings, base_weights: dict, new_raw: dict) -> dict:
     """The comfortable single dial: how much to trust the ML models vs the News/AI
     read, plus the decision thresholds. Returns the new weight dict."""
-    ml = float(base_weights.get("models", 0.4))
     ai = float(base_weights.get("context", 0.2)) + float(base_weights.get("sentiment", 0.05))
-    technicals = float(base_weights.get("technicals", 0.35))
-    intraday = float(base_weights.get("intraday", 0.0))
-    budget = ml + ai
-    default_trust = int(round((ai / budget) * 100)) if budget > 0 else 40
+    total = sum(float(value) for value in base_weights.values()) or 1.0
+    default_trust = int(round((ai / total) * 100))
 
     with _remembered_expander("🎚️ Trust & decision thresholds", "deepdive_trust", expanded=False):
-        st.caption("Move the dial toward what you trust more for this stock. Technical signals keep their weight.")
+        st.caption("Move the dial toward what you trust more for this stock. Technical and intraday signals scale with the price side; at 100%, the decision is driven by the News/AI read.")
         trust = st.slider(
             "Trust balance",
             min_value=0,
@@ -422,31 +427,27 @@ def _render_trust_and_thresholds(settings, base_weights: dict, new_raw: dict) ->
             help="0 = trust the ML price models; 100 = trust the News/AI read. It rebalances how much each side drives the fused score.",
             format="%d%% News/AI",
         )
-        t = trust / 100.0
-        models_w = budget * (1.0 - t)
-        context_w = budget * t * 0.8
-        sentiment_w = budget * t * 0.2
-        weights = {"models": models_w, "technicals": technicals, "intraday": intraday, "context": context_w, "sentiment": sentiment_w}
-        total = sum(weights.values()) or 1.0
+        weights = _trust_balanced_weights(base_weights, trust)
         st.caption(
             "Resulting blend → "
-            + " · ".join(f"{name} {value / total:.0%}" for name, value in weights.items())
+            + " · ".join(f"{name} {value:.0%}" for name, value in weights.items())
         )
 
         ma_default = ",".join(str(int(value)) for value in settings.features.get("ma_windows", [9, 20, 50]))
         ma_text = st.text_input("Moving-average windows", value=ma_default, help="Comma-separated lookbacks for the trend/MA features and chart, e.g. 9,20,50 (fast, medium, slow).")
 
         thresholds = settings.signal_fusion.get("thresholds", {})
-        tc = st.columns(3)
-        long_score = tc[0].slider("Trade score", 0.10, 0.80, float(thresholds.get("long_score", 0.35)), 0.01, help="Score magnitude needed to call a directional (long/short) trade. Lower = more trades, lower selectivity.")
+        tc = st.columns(4)
+        long_score = tc[0].slider("Trade score", 0.10, 0.80, float(thresholds.get("long_score", 0.30)), 0.01, help="Score magnitude needed to call a directional (long/short) trade. Lower = more trades, lower selectivity.")
         watch_score = tc[1].slider("Watch score", 0.05, 0.50, float(thresholds.get("watch_score", 0.18)), 0.01, help="Score magnitude needed to flag a watch (worth keeping an eye on).")
-        min_conf_trade = tc[2].slider("Min confidence to trade", 0.10, 0.80, float(settings.risk.get("min_confidence_for_trade", 0.40)), 0.01, help="Risk-layer confidence gate. Lower = more trades, lower quality.")
+        min_conf_trade = tc[2].slider("Min confidence to trade", 0.10, 0.80, float(settings.risk.get("min_confidence_for_trade", 0.35)), 0.01, help="Risk-layer confidence gate. Lower = more trades, lower quality.")
+        min_risk_reward = tc[3].slider("Min risk/reward", 0.50, 4.00, float(settings.risk.get("min_risk_reward", 1.25)), 0.05, help="Risk-layer reward-to-risk gate. Lower values allow more setups but leave less room for losers.")
 
     parsed_windows = [int(part) for part in ma_text.replace(" ", "").split(",") if part.strip().isdigit()]
     new_raw.setdefault("features", {})["ma_windows"] = parsed_windows or settings.features.get("ma_windows", [9, 20, 50])
     sf = new_raw.setdefault("signal_fusion", {})
     sf.setdefault("thresholds", {}).update({"long_score": long_score, "short_score": -abs(long_score), "watch_score": watch_score})
-    new_raw.setdefault("risk", {})["min_confidence_for_trade"] = min_conf_trade
+    new_raw.setdefault("risk", {}).update({"min_confidence_for_trade": min_conf_trade, "min_risk_reward": min_risk_reward})
     return weights
 
 
@@ -528,6 +529,26 @@ def _resolve_active_weights(settings, horizon: str) -> dict:
     if isinstance(profile, dict) and isinstance(profile.get("weights"), dict):
         base.update(profile["weights"])
     return base
+
+
+def _trust_balanced_weights(base_weights: dict, trust_percent: int | float) -> dict[str, float]:
+    t = min(max(float(trust_percent) / 100.0, 0.0), 1.0)
+    price_keys = ("models", "technicals", "intraday")
+    ai_keys = ("context", "sentiment")
+    price_total = sum(float(base_weights.get(key, 0.0)) for key in price_keys)
+    ai_total = sum(float(base_weights.get(key, 0.0)) for key in ai_keys)
+    price_mix = {
+        key: float(base_weights.get(key, 0.0)) / price_total if price_total else (1.0 if key == "models" else 0.0)
+        for key in price_keys
+    }
+    ai_mix = {
+        key: float(base_weights.get(key, 0.0)) / ai_total if ai_total else (0.8 if key == "context" else 0.2)
+        for key in ai_keys
+    }
+    return {
+        **{key: (1.0 - t) * price_mix[key] for key in price_keys},
+        **{key: t * ai_mix[key] for key in ai_keys},
+    }
 
 
 def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
@@ -682,7 +703,7 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     headline_label = "Live Price" if live_price is not None else "Last Close"
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Action", result.decision.action, help=HELP_TEXT["action"])
+    col1.metric("Action", _action_label(result.decision.action), help=HELP_TEXT["action"])
     col2.metric("Confidence", _format_percent(result.decision.confidence), help=HELP_TEXT["confidence"])
     col3.metric("Score", f"{result.decision.score:.3f}", help=HELP_TEXT["score"])
     col4.metric(
@@ -831,7 +852,7 @@ def _render_trade_plan_summary(result) -> None:
         )
 
     p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("Bias", decision.action, help=HELP_TEXT["bias"])
+    p1.metric("Bias", _action_label(decision.action), help=HELP_TEXT["bias"])
     p2.metric("Setup", plan.setup_quality, help=HELP_TEXT["setup"])
     p3.metric("Confidence", _format_percent(decision.confidence), help=HELP_TEXT["confidence"])
     p4.metric("Risk/Reward", f"{plan.risk_reward:.2f}" if plan.risk_reward is not None else "-", help=HELP_TEXT["risk_reward"])
@@ -882,7 +903,7 @@ def _render_verdict_banner(result) -> None:
     decision = result.decision
     action = str(decision.action)
     sentiment_word = "bullish" if decision.score > 0.05 else "bearish" if decision.score < -0.05 else "neutral"
-    verdict = action.upper().replace("_", " ")
+    verdict, meaning = _action_presentation(action)
     parts = [
         f"**{verdict}**",
         f"score {decision.score:+.3f} ({sentiment_word})",
@@ -891,9 +912,18 @@ def _render_verdict_banner(result) -> None:
     news_phrase = _news_impact_phrase(result)
     if news_phrase:
         parts.append(news_phrase)
-    message = "  ·  ".join(parts)
+    message = "  ·  ".join(parts) + f"\n\n{meaning} Primary reason: {decision.top_reason or 'No dominant reason was produced.'}"
     renderer = {"long": st.success, "short": st.error, "watch": st.info}.get(action, st.warning)
     renderer(message)
+
+
+def _action_presentation(action: str) -> tuple[str, str]:
+    key = str(action).lower()
+    return _ACTION_PRESENTATION.get(key, (key.upper().replace("_", " "), "Review the score attribution and risk checks before acting."))
+
+
+def _action_label(action: str) -> str:
+    return _action_presentation(action)[0]
 
 
 def _render_why_not_actionable(result, settings) -> None:
@@ -908,9 +938,9 @@ def _render_why_not_actionable(result, settings) -> None:
     thresholds = settings.signal_fusion.get("thresholds", {})
     risk_cfg = settings.risk
     watch_score = float(thresholds.get("watch_score", 0.18))
-    long_score = float(thresholds.get("long_score", 0.35))
-    short_score = float(thresholds.get("short_score", -0.35))
-    required_conf = max(float(thresholds.get("min_confidence", 0.30)), float(risk_cfg.get("min_confidence_for_trade", 0.40)))
+    long_score = float(thresholds.get("long_score", 0.30))
+    short_score = float(thresholds.get("short_score", -0.30))
+    required_conf = max(float(thresholds.get("min_confidence", 0.30)), float(risk_cfg.get("min_confidence_for_trade", 0.35)))
 
     blockers: list[str] = []
     if result.calendar is not None and result.calendar.no_trade_flags:

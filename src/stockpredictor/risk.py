@@ -76,7 +76,7 @@ def apply_risk_controls(
             no_trade_reasons=_no_trade_reasons(["fused signal is not actionable"]),
         )
 
-    if decision.confidence < float(risk_cfg.get("min_confidence_for_trade", 0.45)):
+    if decision.confidence < float(risk_cfg.get("min_confidence_for_trade", 0.35)):
         adjusted = replace(decision, action="low_confidence", reasons=decision.reasons + ["risk layer blocked trade: confidence too low"])
         return adjusted, RiskPlan(
             symbol=decision.symbol,
@@ -177,7 +177,7 @@ def apply_risk_controls(
     risk_reward = abs(targets[0] - entry) / abs(entry - stop_loss)
     risk_per_share = abs(entry - stop_loss)
     notes.append(f"Stop anchored on {stop_source}; target anchored on {target_source}.")
-    if risk_reward < float(risk_cfg.get("min_risk_reward", 1.5)):
+    if risk_reward < float(risk_cfg.get("min_risk_reward", 1.25)):
         adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: risk/reward too low"])
         return adjusted, RiskPlan(
             symbol=decision.symbol,

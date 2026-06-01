@@ -302,6 +302,50 @@ def test_confidence_weights_are_config_driven(tmp_path: Path) -> None:
     assert decision.confidence == pytest.approx(0.7, abs=1e-9)
 
 
+def test_zero_model_weight_disables_disagreement_penalties_and_uses_ai_confidence(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline", "momentum"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["signal_fusion"]["weights"] = {
+        "models": 0.0,
+        "technicals": 0.0,
+        "intraday": 0.0,
+        "context": 0.8,
+        "sentiment": 0.2,
+    }
+    raw["horizons"]["profiles"]["swing"]["weights"] = dict(raw["signal_fusion"]["weights"])
+    raw["signal_fusion"]["thresholds"].update(
+        {
+            "long_score": 0.30,
+            "short_score": -0.30,
+            "confidence_score_weight": 0.60,
+            "confidence_component_weight": 0.50,
+            "disagreement_penalty": 0.18,
+            "disagreement_confidence_penalty": 0.12,
+        }
+    )
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    context = ContextSummary(
+        symbol="TEST",
+        enabled=True,
+        score=0.8,
+        sentiment="bullish",
+        features={"news_stance_score": 0.8, "context_confidence": 0.8},
+    )
+    predictions = [
+        ModelPrediction(model="baseline", symbol="TEST", horizon_days=5, direction="up", expected_return=0.04, confidence=0.8, predicted_price=104.0),
+        ModelPrediction(model="momentum", symbol="TEST", horizon_days=5, direction="down", expected_return=-0.04, confidence=0.8, predicted_price=96.0),
+    ]
+
+    decision = fuse_signals("TEST", replace(_bullish_features(), technical_score=-0.8), predictions, context, settings)
+
+    assert decision.action == "long"
+    assert decision.score == pytest.approx(0.72, abs=1e-9)
+    assert decision.confidence == pytest.approx(0.832, abs=1e-9)
+    assert not any(row["component"] == "model disagreement" for row in decision.score_breakdown)
+    assert "model disagreement reduced confidence" not in decision.reasons
+
+
 def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path)
     frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
