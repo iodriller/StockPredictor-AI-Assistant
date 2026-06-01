@@ -69,7 +69,8 @@ class SyntheticProvider:
         rng = np.random.default_rng(self.seed + stable_symbol_seed + 991)
         interval_minutes = max(1, _interval_to_minutes(interval.lower()) or 1)
         bars_per_session = max(60, 390 // interval_minutes)
-        start = pd.Timestamp.now(tz="UTC").normalize().replace(hour=13, minute=30)  # 09:30 ET
+        market_day = pd.Timestamp.now(tz="America/New_York").normalize()
+        start = market_day.replace(hour=9, minute=30).tz_convert("UTC")
         index = pd.date_range(start=start, periods=bars_per_session, freq=f"{interval_minutes}min")
         base_price = 100 + (stable_symbol_seed % 250)
         increments = rng.normal(0.0002, 0.0015, bars_per_session)

@@ -42,6 +42,7 @@ DEFAULT_HORIZONS: dict[str, Any] = {
             "target_r_multiple": 1.5,
             "entry_cushion_atr": 0.25,
             "entry_cushion_pct": 0.002,
+            "max_entry_distance_from_vwap_pct": 0.60,
             "weights": {"models": 0.35, "technicals": 0.30, "intraday": 0.10, "context": 0.20, "sentiment": 0.05},
         },
         "position": {
@@ -51,6 +52,7 @@ DEFAULT_HORIZONS: dict[str, Any] = {
             "target_r_multiple": 2.5,
             "entry_cushion_atr": 0.40,
             "entry_cushion_pct": 0.004,
+            "max_entry_distance_from_vwap_pct": 1.00,
             "weights": {"models": 0.45, "technicals": 0.30, "intraday": 0.0, "context": 0.20, "sentiment": 0.05},
         },
     },

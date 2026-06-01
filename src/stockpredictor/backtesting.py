@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ def run_backtest(
     settings: Settings | None = None,
     symbols: list[str] | None = None,
     provider: MarketDataProvider | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> BacktestReport:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
@@ -33,6 +34,7 @@ def run_backtest(
     equity_curve: list[dict[str, float | str]] = []
     returns: list[float] = []
     trade_log: list[dict[str, float | str | int]] = []
+    symbol_stats: list[dict[str, float | str | int]] = []
     no_trades = 0
     evaluations = 0
     start = ""
@@ -57,7 +59,15 @@ def run_backtest(
     session_blocked: set[str] = set()
     session_skip_counts = {"max_trades_per_day": 0, "max_daily_loss_pct": 0, "stop_after_consecutive_losses": 0}
 
-    for symbol in symbols:
+    total_symbols = len(symbols)
+    if progress_callback:
+        progress_callback(0.02, "Preparing historical simulation")
+    for symbol_index, symbol in enumerate(symbols):
+        if progress_callback:
+            progress_callback(0.05 + (0.95 * symbol_index / total_symbols), f"Loading historical bars for {symbol.upper()}")
+        evaluations_before = evaluations
+        trades_before = len(returns)
+        no_trades_before = no_trades
         frame = fetch_market_data(symbol, settings, provider)
         start = start or frame.index[0].isoformat()
         end = frame.index[-1].isoformat()
@@ -183,6 +193,19 @@ def run_backtest(
                     "equity": equity,
                 }
             )
+        symbol_stats.append(
+            {
+                "symbol": symbol.upper(),
+                "bars": len(frame),
+                "evaluations": evaluations - evaluations_before,
+                "trades": len(returns) - trades_before,
+                "skipped": no_trades - no_trades_before,
+                "start": frame.index[0].isoformat(),
+                "end": frame.index[-1].isoformat(),
+            }
+        )
+        if progress_callback:
+            progress_callback(0.05 + (0.95 * (symbol_index + 1) / total_symbols), f"Completed {symbol.upper()}")
 
     trades = len(returns)
     win_rate = sum(1 for value in returns if value > 0) / trades if trades else 0.0
@@ -205,8 +228,12 @@ def run_backtest(
         no_trade_rate=no_trade_rate,
         evaluations=evaluations,
         no_trades=no_trades,
+        initial_capital=initial_capital,
+        final_equity=equity,
+        total_return=(equity / initial_capital) - 1 if initial_capital else 0.0,
         equity_curve=equity_curve,
         trade_log=trade_log,
+        symbol_stats=symbol_stats,
     )
 
 

@@ -15,7 +15,7 @@ import httpx
 
 from .config import Settings
 from .context import fetch_news_items
-from .utils import clamp, clean_symbol_list
+from .utils import clamp, clean_symbol_list, dedupe_preserve_order
 
 LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[float, str], None]
@@ -281,6 +281,8 @@ def _news_llm_instructions() -> str:
         "reflecting how strongly the headlines support that direction. This stance is an evidence summary, not advice. "
         "Return keys: grand_summary, dominant_category, day_trader_focus, stance, notes. "
         "day_trader_focus must contain catalyst, risk, tradeability, no_trade_flags. "
+        "no_trade_flags must be an empty list when there is no concrete reason to avoid a fresh trade. "
+        "Never put reassuring statements such as 'no significant red flags' into no_trade_flags. "
         "stance must contain direction and conviction."
     )
 
@@ -346,7 +348,7 @@ def _normalize_llm_summary(parsed: dict[str, Any], provider: str) -> dict[str, A
         "catalyst": str(focus.get("catalyst", "No clear catalyst identified.")),
         "risk": str(focus.get("risk", "No clear headline risk identified.")),
         "tradeability": str(focus.get("tradeability", "Confirm with price, volume, VWAP, spread, and levels.")),
-        "no_trade_flags": [str(flag) for flag in no_trade_flags],
+        "no_trade_flags": _normalize_no_trade_flags(no_trade_flags),
     }
     notes = parsed.get("notes", [])
     if isinstance(notes, str):
@@ -363,6 +365,19 @@ def _normalize_llm_summary(parsed: dict[str, Any], provider: str) -> dict[str, A
         "llm_notes": [str(note) for note in notes],
         "analysis_provider": provider,
     }
+
+
+def _normalize_no_trade_flags(flags: list[object]) -> list[str]:
+    cleaned: list[str] = []
+    for flag in flags:
+        text = str(flag).strip()
+        normalized = re.sub(r"\s+", " ", text).lower()
+        if not text or normalized in {"none", "n/a", "na", "no flags", "no no-trade flags"}:
+            continue
+        if re.match(r"^no (significant|material|obvious|major|notable)? ?(red flags?|risks?|concerns?|issues?|blockers?)\b", normalized):
+            continue
+        cleaned.append(text)
+    return dedupe_preserve_order(cleaned)
 
 
 def _normalize_stance(stance: object) -> tuple[str, float, float]:

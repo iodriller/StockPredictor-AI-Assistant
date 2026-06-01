@@ -20,6 +20,6 @@ def test_dashboard_cache_persists_allowed_results(tmp_path: Path) -> None:
         path=tmp_path / "config.yaml",
     )
 
-    save_dashboard_cache(settings, {"latest_scan_symbols": ["AMD"], "ignored": "value"})
+    save_dashboard_cache(settings, {"latest_scan_symbols": ["AMD"], "latest_backtest_depth": "Standard review", "ignored": "value"})
 
-    assert load_dashboard_cache(settings) == {"latest_scan_symbols": ["AMD"]}
+    assert load_dashboard_cache(settings) == {"latest_scan_symbols": ["AMD"], "latest_backtest_depth": "Standard review"}

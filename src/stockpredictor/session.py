@@ -55,6 +55,7 @@ def build_session_context(
     frame = _ensure_market_time_index(intraday_frame, market_tz)
     today = _today_in_market(now_market)
     todays_bars = frame[frame.index.date == today]
+    is_current_session = not todays_bars.empty
     if todays_bars.empty:
         last_session_date = frame.index.date.max() if len(frame.index) else None
         if last_session_date is None:
@@ -70,7 +71,11 @@ def build_session_context(
 
     context.bars_loaded = int(len(todays_bars))
     context.data_available = bool(len(todays_bars))
-    context.live_price = to_float(todays_bars["Close"].iloc[-1], None)
+    context.session_date = todays_bars.index.date.max().isoformat()
+    context.is_live = is_current_session
+    context.reference_price = to_float(todays_bars["Close"].iloc[-1], None)
+    if is_current_session:
+        context.live_price = context.reference_price
 
     if not regular_bars.empty:
         context.session_open = to_float(regular_bars["Open"].iloc[0], None)
@@ -88,7 +93,8 @@ def build_session_context(
         context.premarket_low = to_float(premarket_bars["Low"].min(), None)
         context.premarket_volume = to_float(premarket_bars["Volume"].sum(), None)
 
-    context.time_of_day_rvol = _time_of_day_rvol(frame, todays_bars, now_market)
+    if is_current_session:
+        context.time_of_day_rvol = _time_of_day_rvol(frame, todays_bars, now_market)
     return context
 
 

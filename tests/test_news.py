@@ -537,6 +537,26 @@ def test_normalize_llm_summary_handles_non_list_flags() -> None:
     assert summary["llm_notes"] == []
 
 
+def test_normalize_llm_summary_discards_reassuring_no_trade_flag_text() -> None:
+    summary = _normalize_llm_summary(
+        {
+            "grand_summary": "bullish read",
+            "day_trader_focus": {
+                "catalyst": "AI product launch",
+                "risk": "none",
+                "tradeability": "confirm",
+                "no_trade_flags": [
+                    "No significant red flags; no earnings or macro catalysts are imminent.",
+                    "late extension from VWAP",
+                ],
+            },
+        },
+        "localdeploy",
+    )
+
+    assert summary["day_trader_focus"]["no_trade_flags"] == ["late extension from VWAP"]
+
+
 def test_strip_json_fence_handles_single_line_fence() -> None:
     assert _strip_json_fence('```json{"ok": true}```') == '{"ok": true}'
     assert _strip_json_fence('```\n{"ok": true}\n```') == '{"ok": true}'

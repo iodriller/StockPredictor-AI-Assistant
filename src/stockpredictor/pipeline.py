@@ -64,7 +64,8 @@ def analyze_symbol(
         session = build_session_context(symbol, intraday_frame, settings)
         if intraday_frame is not None:
             intraday_features = build_intraday_features(symbol, intraday_frame, session, settings)
-            intraday_score, intraday_reasons = intraday_technical_score(intraday_features)
+            if session.is_live:
+                intraday_score, intraday_reasons = intraday_technical_score(intraday_features)
 
     # Broad-market and sector cross-check (skipped in backtest).
     market_state = None
@@ -266,6 +267,8 @@ def build_scanner_row(snapshot, features, context, decision, risk_plan) -> dict[
         "vwap_alignment": vwap_alignment,
         "regime": features.regime,
         "trend": str(features.indicators.get("trend", "unknown")),
+        "bias": decision.bias,
+        "signal_action": decision.signal_action or decision.action,
         "action": decision.action,
         "confidence": decision.confidence,
         "score": decision.score,

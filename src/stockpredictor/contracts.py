@@ -26,6 +26,9 @@ class SessionContext:
     minutes_since_open: int | None = None
     minutes_to_close: int | None = None
     live_price: float | None = None
+    reference_price: float | None = None
+    session_date: str = ""
+    is_live: bool = False
     session_open: float | None = None
     session_high: float | None = None
     session_low: float | None = None
@@ -139,6 +142,9 @@ class SignalDecision:
     confidence: float
     score: float
     timeframe: str
+    signal_action: str = ""
+    bias: str = "neutral"
+    execution_blockers: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     model_scores: dict[str, float] = field(default_factory=dict)
     feature_scores: dict[str, float] = field(default_factory=dict)
@@ -189,8 +195,12 @@ class BacktestReport:
     no_trade_rate: float
     evaluations: int = 0
     no_trades: int = 0
+    initial_capital: float = 0.0
+    final_equity: float = 0.0
+    total_return: float = 0.0
     equity_curve: list[dict[str, float | str]] = field(default_factory=list)
     trade_log: list[dict[str, float | str | int]] = field(default_factory=list)
+    symbol_stats: list[dict[str, float | str | int]] = field(default_factory=list)
 
 
 @dataclass

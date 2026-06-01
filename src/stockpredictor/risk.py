@@ -77,7 +77,7 @@ def apply_risk_controls(
         )
 
     if decision.confidence < float(risk_cfg.get("min_confidence_for_trade", 0.35)):
-        adjusted = replace(decision, action="low_confidence", reasons=decision.reasons + ["risk layer blocked trade: confidence too low"])
+        adjusted = _blocked_decision(decision, "low_confidence", "confidence too low")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -94,7 +94,7 @@ def apply_risk_controls(
 
     min_avg_volume = float(risk_cfg.get("min_avg_volume", 0))
     if avg_volume < min_avg_volume:
-        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: liquidity below configured minimum"])
+        adjusted = _blocked_decision(decision, "no_trade", "liquidity below configured minimum")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -110,7 +110,7 @@ def apply_risk_controls(
         )
 
     if atr_pct > float(risk_cfg.get("skip_if_atr_pct_above", 0.12)):
-        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: ATR percentage too high"])
+        adjusted = _blocked_decision(decision, "no_trade", "ATR percentage too high")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -130,7 +130,7 @@ def apply_risk_controls(
     # from a long-window VWAP, so the same cap would block every trending name.
     max_vwap_distance = float(horizon_profile.get("max_entry_distance_from_vwap_pct", risk_cfg.get("max_entry_distance_from_vwap_pct", 1.0)))
     if vwap and abs(latest_price / vwap - 1) > max_vwap_distance:
-        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: price too extended from VWAP"])
+        adjusted = _blocked_decision(decision, "no_trade", "price too extended from VWAP")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -178,7 +178,7 @@ def apply_risk_controls(
     risk_per_share = abs(entry - stop_loss)
     notes.append(f"Stop anchored on {stop_source}; target anchored on {target_source}.")
     if risk_reward < float(risk_cfg.get("min_risk_reward", 1.25)):
-        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: risk/reward too low"])
+        adjusted = _blocked_decision(decision, "no_trade", "risk/reward too low")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -206,7 +206,7 @@ def apply_risk_controls(
     shares_by_value = int((account_size * float(risk_cfg.get("max_position_fraction", 0.20))) // entry)
     position_size = max(0, min(shares_by_risk, shares_by_value))
     if position_size < 1:
-        adjusted = replace(decision, action="no_trade", reasons=decision.reasons + ["risk layer blocked trade: position size below one share"])
+        adjusted = _blocked_decision(decision, "no_trade", "position size below one share")
         return adjusted, RiskPlan(
             symbol=decision.symbol,
             action=adjusted.action,
@@ -271,6 +271,16 @@ def _entry_zone(
     if action == "long":
         return (price - cushion, price + cushion * 0.5)
     return (price - cushion * 0.5, price + cushion)
+
+
+def _blocked_decision(decision: SignalDecision, action: str, reason: str) -> SignalDecision:
+    blocker = f"risk layer blocked trade: {reason}"
+    return replace(
+        decision,
+        action=action,
+        reasons=[*decision.reasons, blocker],
+        execution_blockers=[*decision.execution_blockers, blocker],
+    )
 
 
 def _merge_structural_target(raw_target: float, structural_level: float, entry: float, long: bool) -> tuple[list[float], str]:

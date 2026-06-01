@@ -50,6 +50,7 @@ features:
     - trend
     - market_regime
   ma_windows: [9, 20, 50]
+  vwap_window: 20
   volume_window: 20
   volatility_window: 20
   support_resistance_window: 30

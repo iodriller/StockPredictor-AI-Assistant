@@ -64,7 +64,8 @@ def fuse_signals(
         score = _record_penalty(score, 1 - penalty, "model disagreement", score_breakdown)
         reasons.append("model disagreement reduced confidence")
 
-    # Calendar hard-blocks: earnings within 24h, market closed, high-impact macro event.
+    # Calendar flags always affect execution readiness. A closed market only blocks
+    # intraday setup execution; swing/position analysis can still stage a plan.
     hard_blockers: list[str] = []
     if calendar_context is not None and calendar_context.no_trade_flags:
         hard_blockers.extend(calendar_context.no_trade_flags)
@@ -96,10 +97,15 @@ def fuse_signals(
         0.0,
         1.0,
     )
-    action = _action_from_score(score, confidence, thresholds)
-    if hard_blockers:
+    signal_action = _action_from_score(score, confidence, thresholds)
+    bias = _bias_from_score(score, thresholds)
+    action = signal_action
+    action_blockers = [flag for flag in hard_blockers if _blocks_setup(flag, str(horizon_profile.get("name", "swing")))]
+    if action_blockers:
         action = "no_trade"
-        reasons.extend(f"hard block: {flag}" for flag in hard_blockers)
+        reasons.extend(f"hard block: {flag}" for flag in action_blockers)
+    elif hard_blockers:
+        reasons.extend(f"execution wait: {flag}" for flag in hard_blockers)
     if action in {"no_trade", "low_confidence"}:
         reasons.append("setup is not actionable under configured thresholds")
     deduped_reasons = dedupe_preserve_order(reasons)
@@ -110,6 +116,9 @@ def fuse_signals(
         confidence=confidence,
         score=score,
         timeframe=str(settings.data.get("interval", "1d")),
+        signal_action=signal_action,
+        bias=bias,
+        execution_blockers=dedupe_preserve_order(hard_blockers),
         reasons=deduped_reasons,
         model_scores=model_scores,
         feature_scores={
@@ -119,7 +128,7 @@ def fuse_signals(
         },
         context_score=context_score,
         created_at=now_in_timezone_iso(str(settings.app.get("timezone", "UTC"))),
-        top_reason=deduped_reasons[0] if deduped_reasons else "",
+        top_reason=_dominant_driver_reason(score_breakdown, deduped_reasons),
         score_breakdown=score_breakdown,
     )
 
@@ -209,6 +218,37 @@ def _action_from_score(score: float, confidence: float, thresholds: dict[str, fl
     if abs(score) >= float(thresholds.get("watch_score", 0.18)):
         return "watch"
     return "no_trade"
+
+
+def _bias_from_score(score: float, thresholds: dict[str, float]) -> str:
+    watch_score = float(thresholds.get("watch_score", 0.18))
+    if score >= watch_score:
+        return "bullish"
+    if score <= -watch_score:
+        return "bearish"
+    return "neutral"
+
+
+def _blocks_setup(flag: str, horizon: str) -> bool:
+    return str(flag).lower() != "market is currently closed" or str(horizon).lower() == "intraday"
+
+
+def _dominant_driver_reason(breakdown: list[dict], fallback_reasons: list[str]) -> str:
+    components = [row for row in breakdown if row.get("kind") == "component"]
+    if not components:
+        return fallback_reasons[0] if fallback_reasons else ""
+    dominant = max(components, key=lambda row: abs(float(row.get("contribution", 0.0) or 0.0)))
+    contribution = float(dominant.get("contribution", 0.0) or 0.0)
+    direction = "bullish" if contribution > 0 else "bearish" if contribution < 0 else "neutral"
+    labels = {
+        "models": "price models",
+        "technicals": "technical signals",
+        "intraday": "intraday signals",
+        "context": "news and context",
+        "sentiment": "news sentiment",
+    }
+    label = labels.get(str(dominant.get("component", "")), str(dominant.get("component", "signal")))
+    return f"{label} are {direction} ({contribution:+.3f} score contribution)"
 
 
 def _normalized_weights(weights: dict[str, float]) -> dict[str, float]:

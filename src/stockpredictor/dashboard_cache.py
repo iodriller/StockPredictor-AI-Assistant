@@ -18,6 +18,7 @@ CACHE_KEYS = {
     "latest_news_feed",
     "latest_backtest_report",
     "latest_backtest_symbols",
+    "latest_backtest_depth",
 }
 
 

@@ -48,6 +48,7 @@ def calculate_indicators(frame: pd.DataFrame, settings: Settings) -> dict[str, f
     features_cfg = settings.features
     enabled = set(features_cfg.get("enabled", []))
     latest_values: dict[str, float | str | None] = {}
+    volume_window = int(features_cfg.get("volume_window", 20))
 
     previous_close = close.shift(1)
     latest_values["price_change_pct"] = to_float(close.pct_change().iloc[-1], 0.0)
@@ -55,8 +56,9 @@ def calculate_indicators(frame: pd.DataFrame, settings: Settings) -> dict[str, f
 
     if "vwap" in enabled:
         typical_price = (high + low + close) / 3
-        cumulative_volume = volume.cumsum().replace(0, np.nan)
-        vwap = (typical_price * volume).cumsum() / cumulative_volume
+        vwap_window = int(features_cfg.get("vwap_window", volume_window))
+        rolling_volume = volume.rolling(vwap_window).sum().replace(0, np.nan)
+        vwap = (typical_price * volume).rolling(vwap_window).sum() / rolling_volume
         latest_values["vwap"] = to_float(vwap.iloc[-1], None)
 
     if "moving_averages" in enabled:
@@ -80,7 +82,6 @@ def calculate_indicators(frame: pd.DataFrame, settings: Settings) -> dict[str, f
         latest_values["atr"] = to_float(atr.iloc[-1], None)
         latest_values["atr_pct"] = to_float(atr.iloc[-1] / close.iloc[-1], None)
 
-    volume_window = int(features_cfg.get("volume_window", 20))
     avg_volume = volume.rolling(volume_window).mean()
     latest_values["avg_volume"] = to_float(avg_volume.iloc[-1], None)
     if "volume_anomaly" in enabled:
@@ -149,10 +150,10 @@ def technical_score(latest_price: float, indicators: dict[str, float | str | Non
 
     if vwap and latest_price > vwap:
         score += 0.15
-        reasons.append("price is above VWAP")
+        reasons.append("price is above the rolling volume-weighted average")
     elif vwap and latest_price < vwap:
         score -= 0.15
-        reasons.append("price is below VWAP")
+        reasons.append("price is below the rolling volume-weighted average")
 
     if sma_20 and latest_price > sma_20:
         score += 0.12

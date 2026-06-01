@@ -30,7 +30,7 @@ from stockpredictor.utils import clean_symbol_list, to_float, to_serializable
 
 
 _HELP_BASE = {
-    "action": "The fused decision from models, technicals, context, and risk checks. Treat watch/no-trade/low-confidence as valid outcomes, not failures.",
+    "action": "Entry readiness after signal, calendar, and risk checks. This is separate from directional bias: a stock can be bullish while a fresh entry is blocked or waiting for the market to open.",
     "analysis_provider": "Shows whether news summaries came from the configured LLM, heuristic fallback, or heuristic-only mode.",
     "article_excerpts": "Short excerpts fetched from source links and passed to the LLM. This improves context but is not a full professional news feed.",
     "atr_pct": "Average True Range as a percent of price. Higher ATR means wider stops and more risk per share.",
@@ -39,7 +39,7 @@ _HELP_BASE = {
     "backtest_no_trade_rate": "How often the strategy skipped instead of forcing a trade. A healthy strategy often has a meaningful no-trade rate.",
     "backtest_sharpe_like": "Simple return-to-volatility metric. Useful for comparing runs, but unstable on small samples.",
     "backtest_win_rate": "Percent of simulated trades that were profitable. Needs to be read with average win/loss and drawdown.",
-    "bias": "The current trade bias: long, short, watch, no-trade, or low-confidence.",
+    "bias": "Directional lean after evidence fusion: bullish, bearish, or neutral. Bias is separate from execution readiness.",
     "catalyst_score": "How strongly the context/news pipeline sees a tradable catalyst. Higher is better, but price and volume still need to confirm.",
     "confidence": "How much agreement/strength the fused signal has. Low confidence usually means wait or reduce attention.",
     "context_confidence": "How complete and usable the contextual evidence is. Low context confidence means news/catalyst evidence is thin.",
@@ -65,7 +65,7 @@ _HELP_BASE = {
     "target": "Planned reward area. Targets should be realistic relative to nearby resistance/support and volatility.",
     "top_reason": "The strongest reason behind the current signal. Read with skip reasons before acting.",
     "trade_watch": "Rows that are actionable or worth monitoring. This excludes low-confidence/no-trade rows.",
-    "vwap": "Volume Weighted Average Price. Day traders often use it as an intraday fair-value line.",
+    "vwap": "Volume-weighted price reference. Current-session VWAP is the intraday fair-value line; the daily chart uses a rolling volume-weighted average because daily bars cannot reproduce true session VWAP.",
     "vwap_alignment": "Whether price is above or below VWAP. Above often supports longs; below often warns against longs.",
 }
 
@@ -113,6 +113,12 @@ _ACTION_PRESENTATION = {
     "watch": ("🔵 WATCH", "There is a directional edge, but it has not cleared the trade threshold. Keep it on the screen and wait for confirmation."),
     "low_confidence": ("🟡 LOW CONFIDENCE", "The inputs are mixed or weak. Do not trade until confidence improves."),
     "no_trade": ("⚪ NO TRADE", "The current setup does not justify a new position. Sitting out is the decision."),
+}
+
+_BIAS_PRESENTATION = {
+    "bullish": "BULLISH",
+    "bearish": "BEARISH",
+    "neutral": "NEUTRAL",
 }
 
 
@@ -394,6 +400,94 @@ _MODELS_DISCLAIMER = (
     "and risk plan, not as a standalone buy/sell call."
 )
 
+_SIGNAL_BLEND_PRESETS = {
+    "Custom": {
+        "description": "Shape the evidence blend directly. Use the chart to see whether your thesis is balanced or concentrated before you interpret the signal.",
+        "weights": None,
+    },
+    "Balanced confirmation": {
+        "description": "Use several independent confirmations. Best default when no single catalyst dominates.",
+        "weights": None,
+    },
+    "Price action": {
+        "description": "Prioritize chart structure, VWAP, and intraday behavior. Useful for liquid names moving without a major headline.",
+        "weights": {"models": 0.15, "technicals": 0.40, "intraday": 0.30, "context": 0.12, "sentiment": 0.03},
+    },
+    "Catalyst-led": {
+        "description": "Prioritize fresh news while still requiring price confirmation. Useful for earnings, filings, analyst actions, and event-driven moves.",
+        "weights": {"models": 0.10, "technicals": 0.15, "intraday": 0.10, "context": 0.52, "sentiment": 0.13},
+    },
+    "Trend / swing": {
+        "description": "Prioritize multi-day model and chart trend. Useful when the thesis is continuation rather than a same-day event.",
+        "weights": {"models": 0.45, "technicals": 0.35, "intraday": 0.05, "context": 0.12, "sentiment": 0.03},
+    },
+    "News thesis stress test": {
+        "description": "Use only the News/AI read. This is an explainability experiment, not the recommended live-trading default.",
+        "weights": {"models": 0.0, "technicals": 0.0, "intraday": 0.0, "context": 0.80, "sentiment": 0.20},
+    },
+}
+
+_SIGNAL_COMPONENT_HELP = {
+    "models": "Statistical price forecasts. Traders use these as directional context, not as an entry trigger.",
+    "technicals": "Trend, moving averages, RSI, MACD, VWAP, and levels. Traders use these to judge structure and timing.",
+    "intraday": "Session behavior such as opening range and live VWAP alignment. Most important for day trades.",
+    "context": "Catalysts, filings, macro, sector, and the AI news synthesis. Important when the move is event-driven.",
+    "sentiment": "Directional tone extracted from the news. Supporting evidence; usually smaller than catalyst context.",
+}
+
+_SIGNAL_COMPONENT_LABELS = {
+    "models": "Price models",
+    "technicals": "Technicals",
+    "intraday": "Intraday tape",
+    "context": "News context",
+    "sentiment": "News tone",
+}
+
+_SIGNAL_COMPONENT_KEYS = tuple(_SIGNAL_COMPONENT_LABELS)
+
+_BACKTEST_DEPTH_PRESETS = {
+    "Quick check": {
+        "description": "Fast smoke test for one or two symbols. Useful after changing settings; too small for strategy conclusions.",
+        "period": "6mo",
+        "lookback_rows": 60,
+        "holding_period_days": 5,
+        "evaluation_step_days": 10,
+    },
+    "Standard review": {
+        "description": "Recommended first review. Uses one year of daily bars and checks for a new setup once per trading week.",
+        "period": "1y",
+        "lookback_rows": 90,
+        "holding_period_days": 5,
+        "evaluation_step_days": 5,
+    },
+    "Deeper sample": {
+        "description": "Broader two-year review. Slower, but more useful when the standard run produces too few trades.",
+        "period": "2y",
+        "lookback_rows": 120,
+        "holding_period_days": 5,
+        "evaluation_step_days": 5,
+    },
+}
+
+_CHART_RANGE_BARS = {
+    "30 bars": 30,
+    "60 bars": 60,
+    "Full history": None,
+}
+
+_CHART_LEVEL_LABELS = {
+    "support": "rolling support",
+    "resistance": "rolling resistance",
+    "vwap": "rolling volume-weighted avg",
+    "sma_20": "SMA 20",
+    "sma_50": "SMA 50",
+    "prior_high": "prior high",
+    "prior_low": "prior low",
+    "session_open": "daily open",
+    "opening_range_high": "opening range high",
+    "opening_range_low": "opening range low",
+}
+
 
 def _render_tuning_controls(settings, horizon: str) -> "Settings":
     """Expose the model/signal/LLM parameters as live controls so a trader can tune
@@ -410,27 +504,54 @@ def _render_tuning_controls(settings, horizon: str) -> "Settings":
 
 
 def _render_trust_and_thresholds(settings, base_weights: dict, new_raw: dict) -> dict:
-    """The comfortable single dial: how much to trust the ML models vs the News/AI
-    read, plus the decision thresholds. Returns the new weight dict."""
-    ai = float(base_weights.get("context", 0.2)) + float(base_weights.get("sentiment", 0.05))
-    total = sum(float(value) for value in base_weights.values()) or 1.0
-    default_trust = int(round((ai / total) * 100))
-
-    with _remembered_expander("🎚️ Trust & decision thresholds", "deepdive_trust", expanded=False):
-        st.caption("Move the dial toward what you trust more for this stock. Technical and intraday signals scale with the price side; at 100%, the decision is driven by the News/AI read.")
-        trust = st.slider(
-            "Trust balance",
-            min_value=0,
-            max_value=100,
-            value=default_trust,
-            step=5,
-            help="0 = trust the ML price models; 100 = trust the News/AI read. It rebalances how much each side drives the fused score.",
-            format="%d%% News/AI",
+    """Choose a trader-oriented signal blend and decision thresholds."""
+    with _remembered_expander("Signal lens & decision thresholds", "deepdive_trust", expanded=True):
+        st.caption("Choose the evidence mix for the setup you are researching. The blend changes signal interpretation; entry readiness still checks price, liquidity, levels, and risk.")
+        preset = st.selectbox(
+            "Trading lens",
+            options=list(_SIGNAL_BLEND_PRESETS),
+            index=0,
+            help="Custom starts from the configured horizon weights. Named lenses are quick resets for common research styles; the news-only stress test is for inspecting the AI thesis in isolation.",
         )
-        weights = _trust_balanced_weights(base_weights, trust)
-        st.caption(
-            "Resulting blend → "
-            + " · ".join(f"{name} {value:.0%}" for name, value in weights.items())
+        weights = _signal_blend_weights(base_weights, preset)
+        st.caption(str(_SIGNAL_BLEND_PRESETS[preset]["description"]))
+        controls_col, radar_col = st.columns([3, 2])
+        with controls_col:
+            if preset == "Custom":
+                st.caption("Drag any slider to shape the blend. The other sliders rebalance automatically so the allocation always totals 100%.")
+                _ensure_signal_blend_slider_state(weights)
+                custom = {}
+                for key in _SIGNAL_COMPONENT_KEYS:
+                    custom[key] = st.slider(
+                        _SIGNAL_COMPONENT_LABELS[key],
+                        min_value=0,
+                        max_value=100,
+                        step=1,
+                        format="%d%%",
+                        help=_SIGNAL_COMPONENT_HELP[key],
+                        key=_signal_blend_widget_key(key),
+                        on_change=_rebalance_signal_blend_slider_state,
+                        args=(key,),
+                    ) / 100.0
+                weights = custom
+                st.caption(f"Evidence allocation: {sum(round(value * 100) for value in custom.values())}% / 100%.")
+            else:
+                st.caption("Preset applied. Switch to Custom to tune each evidence input directly.")
+        with radar_col:
+            st.plotly_chart(
+                _signal_blend_radar(weights),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+        st.dataframe(
+            pd.DataFrame(_signal_blend_rows(weights)),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "input": st.column_config.TextColumn("Evidence input"),
+                "weight": st.column_config.NumberColumn("Influence", format="%.0f%%"),
+                "trader_use": st.column_config.TextColumn("How traders use it"),
+            },
         )
 
         ma_default = ",".join(str(int(value)) for value in settings.features.get("ma_windows", [9, 20, 50]))
@@ -456,9 +577,8 @@ def _apply_weight_overrides(new_raw: dict, horizon: str, weights: dict) -> None:
     # The active horizon profile's weights win over base weights in fusion, so apply
     # the override there too — otherwise the trust dial would have no effect.
     profiles = new_raw.setdefault("horizons", {}).setdefault("profiles", {})
-    profile = profiles.get(horizon)
-    if isinstance(profile, dict) and isinstance(profile.get("weights"), dict):
-        profile["weights"].update(weights)
+    profile = profiles.setdefault(horizon, {})
+    profile.setdefault("weights", {}).update(weights)
 
 
 def _render_model_controls(settings, new_raw: dict) -> None:
@@ -531,24 +651,111 @@ def _resolve_active_weights(settings, horizon: str) -> dict:
     return base
 
 
-def _trust_balanced_weights(base_weights: dict, trust_percent: int | float) -> dict[str, float]:
-    t = min(max(float(trust_percent) / 100.0, 0.0), 1.0)
-    price_keys = ("models", "technicals", "intraday")
-    ai_keys = ("context", "sentiment")
-    price_total = sum(float(base_weights.get(key, 0.0)) for key in price_keys)
-    ai_total = sum(float(base_weights.get(key, 0.0)) for key in ai_keys)
-    price_mix = {
-        key: float(base_weights.get(key, 0.0)) / price_total if price_total else (1.0 if key == "models" else 0.0)
-        for key in price_keys
+def _signal_blend_weights(base_weights: dict, preset: str) -> dict[str, float]:
+    configured = _SIGNAL_BLEND_PRESETS.get(preset, _SIGNAL_BLEND_PRESETS["Balanced confirmation"])["weights"]
+    return _normalized_signal_weights(dict(configured) if configured is not None else dict(base_weights))
+
+
+def _normalized_signal_weights(weights: dict[str, float]) -> dict[str, float]:
+    total = sum(max(float(weights.get(key, 0.0)), 0.0) for key in _SIGNAL_COMPONENT_KEYS) or 1.0
+    return {key: max(float(weights.get(key, 0.0)), 0.0) / total for key in _SIGNAL_COMPONENT_KEYS}
+
+
+def _signal_blend_rows(weights: dict[str, float]) -> list[dict]:
+    return [
+        {"input": _SIGNAL_COMPONENT_LABELS[key], "weight": float(weights.get(key, 0.0)) * 100, "trader_use": _SIGNAL_COMPONENT_HELP[key]}
+        for key in _SIGNAL_COMPONENT_KEYS
+    ]
+
+
+def _signal_blend_radar(weights: dict[str, float]) -> go.Figure:
+    labels = [_SIGNAL_COMPONENT_LABELS[key] for key in _SIGNAL_COMPONENT_KEYS]
+    values = [float(weights.get(key, 0.0)) * 100 for key in _SIGNAL_COMPONENT_KEYS]
+    figure = go.Figure(
+        go.Scatterpolar(
+            r=[*values, values[0]],
+            theta=[*labels, labels[0]],
+            fill="toself",
+            fillcolor="rgba(15, 118, 110, 0.22)",
+            line={"color": "#0f766e", "width": 2},
+            hovertemplate="%{theta}: %{r:.0f}%<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=300,
+        margin={"l": 25, "r": 25, "t": 20, "b": 20},
+        polar={
+            "radialaxis": {"visible": True, "range": [0, 100], "ticksuffix": "%", "dtick": 20},
+            "angularaxis": {"direction": "clockwise"},
+        },
+        showlegend=False,
+    )
+    return figure
+
+
+def _signal_blend_widget_key(component: str) -> str:
+    return f"signal_blend_{component}"
+
+
+def _ensure_signal_blend_slider_state(weights: dict[str, float]) -> None:
+    current = {
+        key: st.session_state.get(_signal_blend_widget_key(key))
+        for key in _SIGNAL_COMPONENT_KEYS
     }
-    ai_mix = {
-        key: float(base_weights.get(key, 0.0)) / ai_total if ai_total else (0.8 if key == "context" else 0.2)
-        for key in ai_keys
+    if (
+        all(value is not None for value in current.values())
+        and all(0 <= int(value) <= 100 for value in current.values())
+        and sum(int(value) for value in current.values()) == 100
+    ):
+        return
+    source = current if any(value is not None for value in current.values()) else {
+        key: float(weights.get(key, 0.0)) * 100
+        for key in _SIGNAL_COMPONENT_KEYS
     }
+    for key, value in _integer_signal_allocations(source).items():
+        st.session_state[_signal_blend_widget_key(key)] = value
+
+
+def _rebalance_signal_blend_slider_state(changed_component: str) -> None:
+    allocations = {
+        key: st.session_state.get(_signal_blend_widget_key(key), 0)
+        for key in _SIGNAL_COMPONENT_KEYS
+    }
+    for key, value in _rebalance_signal_allocations(allocations, changed_component).items():
+        st.session_state[_signal_blend_widget_key(key)] = value
+
+
+def _rebalance_signal_allocations(allocations: dict[str, float], changed_component: str) -> dict[str, int]:
+    if changed_component not in _SIGNAL_COMPONENT_KEYS:
+        raise ValueError(f"Unknown signal component: {changed_component}")
+    changed_value = min(max(int(round(float(allocations.get(changed_component, 0)))), 0), 100)
+    other_components = [key for key in _SIGNAL_COMPONENT_KEYS if key != changed_component]
+    rebalanced = _integer_signal_allocations(
+        {key: allocations.get(key, 0) for key in other_components},
+        total=100 - changed_value,
+    )
     return {
-        **{key: (1.0 - t) * price_mix[key] for key in price_keys},
-        **{key: t * ai_mix[key] for key in ai_keys},
+        key: changed_value if key == changed_component else rebalanced[key]
+        for key in _SIGNAL_COMPONENT_KEYS
     }
+
+
+def _integer_signal_allocations(weights: dict[str, float | None], total: int = 100) -> dict[str, int]:
+    keys = list(weights)
+    if not keys:
+        return {}
+    safe_total = max(int(total), 0)
+    positive = {key: max(float(weights.get(key) or 0.0), 0.0) for key in keys}
+    weight_total = sum(positive.values())
+    raw = {
+        key: safe_total * (positive[key] / weight_total if weight_total else 1.0 / len(keys))
+        for key in keys
+    }
+    result = {key: int(value) for key, value in raw.items()}
+    remainder = safe_total - sum(result.values())
+    for key in sorted(keys, key=lambda item: (raw[item] - result[item], -keys.index(item)), reverse=True)[:remainder]:
+        result[key] += 1
+    return result
 
 
 def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
@@ -566,6 +773,7 @@ def _render_horizon_selector(container, horizon_options: list[str], default_hori
 def _scanner_summary_df(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "symbol",
+        "bias",
         "action",
         "rank_score",
         "confidence",
@@ -698,12 +906,12 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     st.caption(f"Showing last completed analysis: {result.snapshot.symbol} ({result.horizon})")
 
     session = result.session
-    live_price = session.live_price if session is not None else None
+    live_price = session.live_price if _session_is_live(session) else None
     headline_price = live_price if live_price is not None else result.snapshot.latest_close
     headline_label = "Live Price" if live_price is not None else "Last Close"
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Action", _action_label(result.decision.action), help=HELP_TEXT["action"])
+    col1.metric("Entry Readiness", _entry_readiness_label(result.decision), help=HELP_TEXT["action"])
     col2.metric("Confidence", _format_percent(result.decision.confidence), help=HELP_TEXT["confidence"])
     col3.metric("Score", f"{result.decision.score:.3f}", help=HELP_TEXT["score"])
     col4.metric(
@@ -714,17 +922,22 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     )
 
     _render_verdict_banner(result)
+    _render_result_explanation(result)
 
     if session is not None and session.data_available:
+        session_scope = "Current session" if _session_is_live(session) else f"Reference session {getattr(session, 'session_date', '') or 'latest available'}"
         st.caption(
-            f"Session: {session.market_session} ({session.bars_loaded} intraday bars). "
+            f"{session_scope}: {session.market_session} ({session.bars_loaded} intraday bars). "
             f"Horizon: {result.horizon}."
         )
+        if not _session_is_live(session):
+            st.info("Intraday bars are from the most recent completed session. They are shown for reference only and do not drive the current risk plan or intraday score.")
         sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        sc1.metric("Session VWAP", _format_price(session.session_vwap) if session.session_vwap else "-", help=HELP_TEXT["vwap"])
-        sc2.metric("Session Open", _format_price(session.session_open) if session.session_open else "-", help="First regular-session price in the loaded intraday data.")
-        sc3.metric("Session High", _format_price(session.session_high) if session.session_high else "-", help="Highest price in the loaded session data.")
-        sc4.metric("Session Low", _format_price(session.session_low) if session.session_low else "-", help="Lowest price in the loaded session data.")
+        level_prefix = "Session" if _session_is_live(session) else "Prior Session"
+        sc1.metric(f"{level_prefix} VWAP", _format_price(session.session_vwap) if session.session_vwap else "-", help=HELP_TEXT["vwap"])
+        sc2.metric(f"{level_prefix} Open", _format_price(session.session_open) if session.session_open else "-", help="First regular-session price in the loaded intraday data.")
+        sc3.metric(f"{level_prefix} High", _format_price(session.session_high) if session.session_high else "-", help="Highest price in the loaded session data.")
+        sc4.metric(f"{level_prefix} Low", _format_price(session.session_low) if session.session_low else "-", help="Lowest price in the loaded session data.")
         sc5.metric(
             "TOD RVOL",
             f"{session.time_of_day_rvol:.2f}" if session.time_of_day_rvol is not None else "-",
@@ -777,8 +990,24 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
                 st.caption(f"Previous action: {diff.get('previous_action', '-')} @ {diff.get('previous_timestamp', '-')}")
 
     st.subheader("Chart And Levels")
+    chart_range = st.segmented_control(
+        "Daily chart range",
+        options=list(_CHART_RANGE_BARS),
+        default="30 bars",
+        help="Use 30 bars for the active setup, 60 for swing context, or full history for the broad trend. Candles are unadjusted daily OHLC bars from the configured provider.",
+    )
+    st.caption(
+        f"Source: {result.snapshot.provider} daily OHLC bars through {result.snapshot.as_of}. "
+        "The volume-weighted average is a rolling daily-bar reference; Session VWAP above is the true intraday session anchor when current minute bars are available."
+    )
     st.plotly_chart(
-        _price_chart(frame, result.features.levels, result.risk_plan, ma_windows=settings.features.get("ma_windows", [9, 20, 50])),
+        _price_chart(
+            frame,
+            result.features.levels,
+            result.risk_plan,
+            ma_windows=settings.features.get("ma_windows", [9, 20, 50]),
+            visible_bars=_CHART_RANGE_BARS.get(str(chart_range), 30),
+        ),
         width="stretch",
     )
 
@@ -808,9 +1037,12 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
             pd.DataFrame(
                 [
                     {
+                        "bias": _decision_bias(result.decision),
+                        "signal_action": _decision_signal_action(result.decision),
                         "action": result.decision.action,
                         "confidence": result.decision.confidence * 100,
                         "score": result.decision.score,
+                        "execution_blockers": "; ".join(_decision_execution_blockers(result.decision)),
                         "top_reason": result.decision.top_reason,
                         "reasons": "; ".join(result.decision.reasons),
                     }
@@ -851,12 +1083,14 @@ def _render_trade_plan_summary(result) -> None:
             "position size fits max risk, and the invalidation is obvious."
         )
 
-    p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("Bias", _action_label(decision.action), help=HELP_TEXT["bias"])
-    p2.metric("Setup", plan.setup_quality, help=HELP_TEXT["setup"])
-    p3.metric("Confidence", _format_percent(decision.confidence), help=HELP_TEXT["confidence"])
-    p4.metric("Risk/Reward", f"{plan.risk_reward:.2f}" if plan.risk_reward is not None else "-", help=HELP_TEXT["risk_reward"])
-    p5.metric("Position", f"{plan.position_size:,}" if plan.position_size else "-", help=HELP_TEXT["position"])
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    p1.metric("Bias", _bias_label(_decision_bias(decision)), help=HELP_TEXT["bias"])
+    p2.metric("Signal", _action_label(_decision_signal_action(decision)), help="Directional signal before calendar and risk execution gates.")
+    p3.metric("Entry Readiness", _entry_readiness_label(decision), help=HELP_TEXT["action"])
+    p4.metric("Confidence", _format_percent(decision.confidence), help=HELP_TEXT["confidence"])
+    p5.metric("Risk/Reward", f"{plan.risk_reward:.2f}" if plan.risk_reward is not None else "-", help=HELP_TEXT["risk_reward"])
+    p6.metric("Position", f"{plan.position_size:,}" if plan.position_size else "-", help=HELP_TEXT["position"])
+    st.caption(f"Setup quality: {plan.setup_quality}")
 
     levels = [
         {"field": "Entry zone", "value": _format_price_range(plan.entry_zone)},
@@ -903,18 +1137,139 @@ def _render_verdict_banner(result) -> None:
     decision = result.decision
     action = str(decision.action)
     sentiment_word = "bullish" if decision.score > 0.05 else "bearish" if decision.score < -0.05 else "neutral"
-    verdict, meaning = _action_presentation(action)
+    _, meaning = _action_presentation(action)
+    signal_action = _decision_signal_action(decision)
     parts = [
-        f"**{verdict}**",
+        f"**{_bias_label(_decision_bias(decision))} BIAS**",
+        f"signal {_action_label(signal_action)}",
+        f"entry readiness {_entry_readiness_label(decision)}",
         f"score {decision.score:+.3f} ({sentiment_word})",
         f"confidence {decision.confidence:.0%}",
     ]
     news_phrase = _news_impact_phrase(result)
     if news_phrase:
         parts.append(news_phrase)
-    message = "  ·  ".join(parts) + f"\n\n{meaning} Primary reason: {decision.top_reason or 'No dominant reason was produced.'}"
+    blocker_text = ""
+    execution_blockers = _decision_execution_blockers(decision)
+    if execution_blockers:
+        blocker_text = " Blocked by: " + "; ".join(execution_blockers) + "."
+    message = "  ·  ".join(parts) + f"\n\n{meaning}{blocker_text} Primary reason: {decision.top_reason or 'No dominant reason was produced.'}"
     renderer = {"long": st.success, "short": st.error, "watch": st.info}.get(action, st.warning)
     renderer(message)
+
+
+def _render_result_explanation(result) -> None:
+    decision = result.decision
+    rows = _score_attribution_rows(decision)
+    st.subheader("Why This Result")
+    st.write(_result_explanation_text(decision))
+    blockers = _decision_execution_blockers(decision)
+    if blockers:
+        st.warning("Execution wait: " + "; ".join(blockers) + ". The setup can still be directionally valid; re-check price and risk before placing a trade.")
+    elif decision.action in {"long", "short"}:
+        st.success("Execution gate passed. Review the entry zone, stop, target, liquidity, and position size before acting.")
+    else:
+        st.info("No executable setup passed the configured signal and risk gates.")
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "input": st.column_config.TextColumn("Input", help="Evidence group or penalty used by the fusion layer."),
+            "kind": st.column_config.TextColumn("Kind", help="Evidence is a weighted vote. Penalty reduces the fused score after voting."),
+            "raw_score": st.column_config.NumberColumn("Raw signal", format="%+.3f", help="Directional value before weighting: positive is bullish, negative is bearish."),
+            "weight": st.column_config.NumberColumn("Influence", format="%.0f%%", help="Configured influence for evidence rows. Penalties show the multiplier applied."),
+            "contribution": st.column_config.NumberColumn("Score effect", format="%+.3f", help="Signed amount this row added to or removed from the final score."),
+            "explanation": st.column_config.TextColumn("Interpretation", help="Plain-language explanation of how this row affected the result."),
+        },
+    )
+    with _remembered_expander("Model vote explainability", f"model_vote_explanation_{decision.symbol}", expanded=False):
+        st.caption("Models estimate direction from price history. Their votes are evidence, not entry triggers. Compare them with chart structure, volume, catalysts, and risk.")
+        st.dataframe(
+            pd.DataFrame(_model_vote_rows(result)),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "model": st.column_config.TextColumn("Model"),
+                "direction": st.column_config.TextColumn("Forecast"),
+                "expected_return": st.column_config.NumberColumn("Expected return", format="%+.2f%%"),
+                "confidence": st.column_config.NumberColumn("Model confidence", format="%.1f%%"),
+                "vote": st.column_config.NumberColumn("Directional vote", format="%+.3f"),
+                "predicted_price": st.column_config.NumberColumn("Predicted price", format="$%.2f"),
+                "explanation": st.column_config.TextColumn("What this means"),
+            },
+        )
+
+
+def _score_attribution_rows(decision) -> list[dict]:
+    rows = []
+    for row in decision.score_breakdown or []:
+        component = str(row.get("component", ""))
+        kind = str(row.get("kind", ""))
+        contribution = float(row.get("contribution", 0.0) or 0.0)
+        weight = float(row.get("weight", 0.0) or 0.0)
+        rows.append(
+            {
+                "input": _humanize_key(component),
+                "kind": "evidence" if kind == "component" else kind,
+                "raw_score": row.get("raw_score"),
+                "weight": weight * 100,
+                "contribution": contribution,
+                "explanation": _attribution_explanation(component, kind, contribution),
+            }
+        )
+    return sorted(rows, key=lambda row: abs(float(row["contribution"])), reverse=True)
+
+
+def _attribution_explanation(component: str, kind: str, contribution: float) -> str:
+    direction = "supported a bullish read" if contribution > 0 else "supported a bearish read" if contribution < 0 else "was neutral"
+    if kind != "component":
+        return f"Reduced the prior fused score by {abs(contribution):.3f}."
+    labels = {
+        "models": "Statistical price forecasts",
+        "technicals": "Chart structure and indicators",
+        "intraday": "Current session behavior",
+        "context": "Catalysts and AI news context",
+        "sentiment": "News tone",
+    }
+    return f"{labels.get(component, _humanize_key(component))} {direction}."
+
+
+def _result_explanation_text(decision) -> str:
+    rows = _score_attribution_rows(decision)
+    positive = [row for row in rows if float(row["contribution"]) > 0][:2]
+    negative = [row for row in rows if float(row["contribution"]) < 0][:2]
+    driver_text = ", ".join(f"{row['input']} {float(row['contribution']):+.3f}" for row in positive) or "no bullish driver"
+    offset_text = ", ".join(f"{row['input']} {float(row['contribution']):+.3f}" for row in negative) or "no material bearish offset"
+    return (
+        f"{_bias_label(_decision_bias(decision))} bias with {_action_label(_decision_signal_action(decision))} signal: "
+        f"the strongest positive drivers were {driver_text}. The main offsets were {offset_text}. "
+        f"Final fused score: {decision.score:+.3f}; confidence: {decision.confidence:.0%}."
+    )
+
+
+def _model_vote_rows(result) -> list[dict]:
+    rows = []
+    for prediction in result.predictions:
+        vote = float(result.decision.model_scores.get(prediction.model, 0.0))
+        rows.append(
+            {
+                "model": prediction.model,
+                "direction": prediction.direction,
+                "expected_return": float(prediction.expected_return) * 100,
+                "confidence": float(prediction.confidence) * 100,
+                "vote": vote,
+                "predicted_price": prediction.predicted_price,
+                "explanation": _model_vote_explanation(vote, float(prediction.confidence)),
+            }
+        )
+    return rows
+
+
+def _model_vote_explanation(vote: float, confidence: float) -> str:
+    direction = "bullish" if vote > 0.05 else "bearish" if vote < -0.05 else "neutral"
+    strength = "strong" if abs(vote) >= 0.65 else "moderate" if abs(vote) >= 0.30 else "weak"
+    return f"{strength.title()} {direction} price-history vote with {confidence:.0%} model confidence."
 
 
 def _action_presentation(action: str) -> tuple[str, str]:
@@ -924,6 +1279,42 @@ def _action_presentation(action: str) -> tuple[str, str]:
 
 def _action_label(action: str) -> str:
     return _action_presentation(action)[0]
+
+
+def _entry_readiness_label(decision) -> str:
+    blockers = _decision_execution_blockers(decision)
+    action = str(decision.action)
+    if blockers:
+        if action in {"long", "short"} and all(str(blocker).lower() == "market is currently closed" for blocker in blockers):
+            return "WAIT FOR MARKET OPEN"
+        return "SKIP FRESH ENTRY"
+    if action in {"long", "short"}:
+        return "READY TO REVIEW"
+    if action == "watch":
+        return "WATCH FOR CONFIRMATION"
+    if action == "low_confidence":
+        return "WAIT FOR CLEARER EDGE"
+    return "SKIP FRESH ENTRY"
+
+
+def _bias_label(bias: str) -> str:
+    return _BIAS_PRESENTATION.get(str(bias).lower(), str(bias).upper() or "NEUTRAL")
+
+
+def _decision_signal_action(decision) -> str:
+    return str(getattr(decision, "signal_action", "") or decision.action)
+
+
+def _decision_bias(decision) -> str:
+    bias = str(getattr(decision, "bias", "") or "").lower()
+    if bias:
+        return bias
+    score = float(getattr(decision, "score", 0.0) or 0.0)
+    return "bullish" if score > 0.05 else "bearish" if score < -0.05 else "neutral"
+
+
+def _decision_execution_blockers(decision) -> list[str]:
+    return list(getattr(decision, "execution_blockers", []) or [])
 
 
 def _render_why_not_actionable(result, settings) -> None:
@@ -971,6 +1362,12 @@ def _render_why_not_actionable(result, settings) -> None:
         hints.append("models, technicals, and news agreeing on a clearer direction")
     if decision.confidence < required_conf:
         hints.append("higher conviction across components")
+    if plan.setup_quality == "poor_risk_reward":
+        hints.append("a pullback that tightens risk, or a confirmed break above nearby resistance before recalculating the plan")
+    if _decision_execution_blockers(decision) and all(
+        str(blocker).lower() == "market is currently closed" for blocker in _decision_execution_blockers(decision)
+    ):
+        hints.append("the market reopening, followed by a fresh price and spread check")
     if hints:
         st.caption("Would become actionable with: " + "; ".join(hints) + ".")
 
@@ -997,7 +1394,6 @@ def _render_news_decision_panel(result) -> None:
             "models, technicals, and configured context only. Enable "
             "`context_agent.news_analysis` (and `use_in_decision`) to feed news into the decision."
         )
-        _render_score_attribution(result.decision)
         return
 
     provider = str(news.get("analysis_provider", "heuristic"))
@@ -1041,57 +1437,11 @@ def _render_news_decision_panel(result) -> None:
     elif provider == "llm_error":
         st.warning(f"LLM summary failed; headlines below are still available. Error: {news.get('llm_error', 'unknown error')}")
 
-    _render_score_attribution(result.decision)
-
     if evidence:
         with _remembered_expander(f"Headlines used in this decision ({len(evidence)})", f"decision_news_evidence_{result.snapshot.symbol}", expanded=False):
             ev_df = pd.DataFrame(evidence)
             columns = [column for column in ["provider", "published", "classification_provider", "category", "sentiment", "impact", "day_trader_relevance", "freshness", "title", "url"] if column in ev_df.columns]
             st.dataframe(ev_df[columns], width="stretch", hide_index=True, column_config=_headline_column_config())
-
-
-def _render_score_attribution(decision) -> None:
-    breakdown = list(decision.score_breakdown or [])
-    if not breakdown:
-        return
-    rows = [
-        {
-            "input": _humanize_key(str(row.get("component", ""))),
-            "kind": str(row.get("kind", "")),
-            "raw_score": row.get("raw_score"),
-            "weight": row.get("weight"),
-            "contribution": row.get("contribution"),
-        }
-        for row in breakdown
-    ]
-    news_contribution = sum(
-        float(row.get("contribution", 0.0) or 0.0)
-        for row in breakdown
-        if row.get("kind") == "component" and str(row.get("component")) in {"context", "sentiment"}
-    )
-    news_penalty = sum(
-        float(row.get("contribution", 0.0) or 0.0)
-        for row in breakdown
-        if row.get("kind") == "penalty" and "news" in str(row.get("component", "")).lower()
-    )
-    with _remembered_expander("Score attribution (white box)", f"decision_score_attribution_{decision.symbol}", expanded=True):
-        st.caption(
-            f"News-driven inputs (context + sentiment) contributed {news_contribution:+.3f} of the "
-            f"{decision.score:.3f} fused score"
-            + (f"; news no-trade flags then applied {news_penalty:+.3f}." if news_penalty else ".")
-        )
-        st.dataframe(
-            pd.DataFrame(rows),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "input": st.column_config.TextColumn("Input", help="Signal component or penalty applied to the fused score."),
-                "kind": st.column_config.TextColumn("Kind", help="component = weighted input; penalty = multiplicative confidence shave."),
-                "raw_score": st.column_config.NumberColumn("Raw", format="%.3f", help="Component score before weighting (blank for penalties)."),
-                "weight": st.column_config.NumberColumn("Weight/Factor", format="%.2f", help="Fusion weight for components; multiplier for penalties."),
-                "contribution": st.column_config.NumberColumn("Contribution", format="%+.3f", help="Signed amount this input added to (or removed from) the fused score."),
-            },
-        )
 
 
 def _render_context_panel(result) -> None:
@@ -1123,7 +1473,14 @@ def _render_context_panel(result) -> None:
             st.write(result.context.risks)
 
 
-def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan=None, ma_windows: list[int] | None = None):
+def _price_chart(
+    frame: pd.DataFrame,
+    levels: dict[str, float | None],
+    risk_plan=None,
+    ma_windows: list[int] | None = None,
+    visible_bars: int | None = 30,
+):
+    chart_frame = frame.tail(visible_bars).copy() if visible_bars else frame.copy()
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -1133,11 +1490,11 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
     )
     fig.add_trace(
         go.Candlestick(
-            x=frame.index,
-            open=frame["Open"],
-            high=frame["High"],
-            low=frame["Low"],
-            close=frame["Close"],
+            x=chart_frame.index,
+            open=chart_frame["Open"],
+            high=chart_frame["High"],
+            low=chart_frame["Low"],
+            close=chart_frame["Close"],
             name="Price",
         ),
         row=1,
@@ -1146,13 +1503,13 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
     for window in [int(value) for value in (ma_windows or [])]:
         column = f"sma_{window}"
         if len(frame) >= window:
-            fig.add_trace(go.Scatter(x=frame.index, y=frame["Close"].rolling(window).mean(), mode="lines", name=column.upper()), row=1, col=1)
-    if "Volume" in frame:
-        fig.add_trace(go.Bar(x=frame.index, y=frame["Volume"], name="Volume", marker_color="#8892a6"), row=2, col=1)
-    chart_levels = dict(levels)
+            moving_average = frame["Close"].rolling(window).mean().reindex(chart_frame.index)
+            fig.add_trace(go.Scatter(x=chart_frame.index, y=moving_average, mode="lines", name=column.upper()), row=1, col=1)
+    if "Volume" in chart_frame:
+        fig.add_trace(go.Bar(x=chart_frame.index, y=chart_frame["Volume"], name="Volume", marker_color="#8892a6"), row=2, col=1)
+    chart_levels = _chart_levels_for_view(levels, chart_frame)
     for name, value in chart_levels.items():
-        if value:
-            fig.add_hline(y=float(value), annotation_text=f"{name}: {_format_price(float(value))}", line_dash="dot", opacity=0.55, row=1, col=1)
+        fig.add_hline(y=float(value), annotation_text=f"{_CHART_LEVEL_LABELS.get(name, _humanize_key(name))}: {_format_price(float(value))}", line_dash="dot", opacity=0.55, row=1, col=1)
     if risk_plan is not None:
         if risk_plan.entry_zone:
             fig.add_hrect(
@@ -1173,6 +1530,42 @@ def _price_chart(frame: pd.DataFrame, levels: dict[str, float | None], risk_plan
             fig.add_hline(y=float(target), annotation_text=f"target {index}: {_format_price(target)}", line_color="#1f9d55", row=1, col=1)
     fig.update_layout(height=560, margin={"l": 20, "r": 20, "t": 10, "b": 20}, xaxis_rangeslider_visible=False)
     return fig
+
+
+def _session_is_live(session) -> bool:
+    return bool(session is not None and getattr(session, "is_live", False) and session.live_price is not None)
+
+
+def _chart_levels_for_view(levels: dict[str, float | None], chart_frame: pd.DataFrame) -> dict[str, float]:
+    if chart_frame.empty:
+        return {}
+    chart_low = float(chart_frame["Low"].min())
+    chart_high = float(chart_frame["High"].max())
+    padding = max((chart_high - chart_low) * 0.08, chart_high * 0.01)
+    lower_bound = chart_low - padding
+    upper_bound = chart_high + padding
+    priority = [
+        "resistance",
+        "support",
+        "prior_high",
+        "prior_low",
+        "session_open",
+        "vwap",
+        "sma_20",
+        "sma_50",
+        "opening_range_high",
+        "opening_range_low",
+    ]
+    ordered_names = [*priority, *(name for name in levels if name not in priority)]
+    visible: dict[str, float] = {}
+    for name in ordered_names:
+        value = to_float(levels.get(name), None)
+        if value is None or not lower_bound <= value <= upper_bound:
+            continue
+        if any(abs(value / existing - 1) < 0.0075 for existing in visible.values() if existing):
+            continue
+        visible[name] = value
+    return visible
 
 
 def _render_scanner_filters(df: pd.DataFrame, settings) -> pd.DataFrame:
@@ -1439,58 +1832,191 @@ def _render_news_feed(feed: dict, headline_limit: int) -> None:
 
 def _render_backtest(settings, symbols: list[str]) -> None:
     st.subheader("Backtest")
-    selected_symbols = symbols or settings.watchlist()
-    st.caption(f"Symbols: {', '.join(selected_symbols[:12])}{'...' if len(selected_symbols) > 12 else ''}")
-    with _remembered_expander("Simulation Settings", "backtest_simulation_settings", expanded=False):
+    st.write("Replay the configured signal and risk rules on historical daily bars. Use this to reject weak ideas and inspect behavior, not to prove future profit.")
+    st.info("Historical news and AI summaries are excluded because the free providers do not supply point-in-time news archives. This test measures the repeatable price, technical, and risk path.")
+    available_symbols = clean_symbol_list(symbols or settings.watchlist())
+    if not available_symbols:
+        st.warning("Add at least one symbol in the sidebar before running a historical check.")
+        return
+    selected_symbols = st.multiselect(
+        "Symbols to simulate",
+        options=available_symbols,
+        default=available_symbols[:1],
+        help="Start with one symbol so the first run is easy to read. Add symbols when you want a broader sample.",
+    )
+    depth = st.selectbox(
+        "Simulation depth",
+        options=list(_BACKTEST_DEPTH_PRESETS),
+        index=1,
+        help="Quick is a smoke test. Standard is the recommended first review. Deeper fetches more history and takes longer.",
+    )
+    run_settings = _backtest_settings_for_depth(settings, depth)
+    profile = _BACKTEST_DEPTH_PRESETS[depth]
+    st.caption(str(profile["description"]))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("History", str(profile["period"]), help="How much daily price history is downloaded for each selected symbol.")
+    c2.metric("Warm-up", f"{profile['lookback_rows']} bars", help="Bars gathered before the first simulated decision. The indicators and model need this history before they can vote.")
+    c3.metric("Hold", f"{profile['holding_period_days']} days", help="Maximum number of trading days before an open simulated trade exits by time.")
+    c4.metric("Re-check", f"Every {profile['evaluation_step_days']} days", help="How often history asks whether a fresh setup exists. Wider spacing is faster but produces fewer evaluations.")
+    with _remembered_expander("Costs And Position Sizing", "backtest_simulation_settings", expanded=False):
+        st.write("The simulation includes configured slippage and commission. Actionable trades use the same planned position sizing as the Trade Plan risk layer.")
         st.dataframe(
             pd.DataFrame(
                 [
-                    {"field": "Initial capital", "value": _format_price(float(settings.backtest.get("initial_capital", 0)))},
-                    {"field": "Holding period", "value": f"{settings.backtest.get('holding_period_days', '-')} days"},
-                    {"field": "Evaluation step", "value": f"{settings.backtest.get('evaluation_step_days', '-')} days"},
-                    {"field": "Slippage", "value": f"{settings.backtest.get('slippage_bps', '-')} bps"},
-                    {"field": "Commission", "value": _format_price(float(settings.backtest.get("commission_per_trade", 0)))},
+                    {"field": "Initial capital", "value": _format_price(float(run_settings.backtest.get("initial_capital", 0)))},
+                    {"field": "Slippage", "value": f"{run_settings.backtest.get('slippage_bps', '-')} bps"},
+                    {"field": "Commission", "value": _format_price(float(run_settings.backtest.get("commission_per_trade", 0)))},
+                    {"field": "Model subset", "value": ", ".join(str(name) for name in run_settings.backtest.get("model_subset", [])) or "configured models"},
                 ]
             ),
             width="stretch",
             hide_index=True,
-    )
-    if st.button("Run Backtest On Selected Symbols", type="primary", help="Run historical simulation using the selected symbols and current config. Treat results as a logic check, not proof of future edge."):
+        )
+    if st.button("Run Historical Check", type="primary", disabled=not selected_symbols, help="Replay the configured historical signal path for the selected symbols."):
         progress = st.progress(0, text="Preparing backtest")
-        progress.progress(0.20, text="Loading historical bars and running signal path")
-        with st.spinner("Running historical simulation"):
-            report = run_backtest(settings, symbols=symbols or None)
+        status = st.empty()
+
+        def update_progress(value: float, message: str) -> None:
+            status.caption(message)
+            progress.progress(float(value), text=message)
+
+        try:
+            with st.spinner("Running historical simulation"):
+                report = run_backtest(run_settings, symbols=selected_symbols, progress_callback=update_progress)
+        except Exception as exc:
+            progress.empty()
+            status.empty()
+            st.error(f"Historical check failed: {exc}")
+            st.info("Try one symbol with Quick check first. If it still fails, inspect the market-data provider and network connection.")
+            return
         progress.progress(1.0, text="Backtest ready")
+        status.caption("Historical check complete")
         st.session_state.latest_backtest_report = report
         st.session_state.latest_backtest_symbols = selected_symbols
+        st.session_state.latest_backtest_depth = depth
         _persist_dashboard_cache(settings)
     report = st.session_state.get("latest_backtest_report")
     if report is not None:
         completed_symbols = st.session_state.get("latest_backtest_symbols", [])
+        completed_depth = st.session_state.get("latest_backtest_depth", "")
         if completed_symbols:
-            st.caption(f"Showing last completed backtest: {', '.join(completed_symbols)}")
+            st.caption(f"Showing last completed historical check: {', '.join(completed_symbols)}{f' · {completed_depth}' if completed_depth else ''}")
         _render_backtest_report(report)
 
 
 def _render_backtest_report(report) -> None:
-    report_df = pd.DataFrame([asdict(report)]).drop(columns=["equity_curve", "trade_log"])
-    report_df = _percent_display(report_df, ["win_rate", "average_return", "max_drawdown", "no_trade_rate"])
-    st.dataframe(
-        report_df,
-        width="stretch",
-        hide_index=True,
-        column_config=_backtest_column_config(),
-    )
+    evaluations = int(getattr(report, "evaluations", 0))
+    trades = int(getattr(report, "trades", 0))
+    no_trades = int(getattr(report, "no_trades", 0))
+    st.subheader("Result Snapshot")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Evaluations", evaluations, help="Historical moments where the strategy checked whether a new setup existed.")
+    c2.metric("Trades", trades, help="Evaluations that passed the configured signal and risk gates.")
+    c3.metric("Skipped", no_trades, help="Evaluations where the strategy correctly chose not to open a fresh position.")
+    c4.metric("No-trade rate", _format_percent(float(getattr(report, "no_trade_rate", 0.0))), help=HELP_TEXT["backtest_no_trade_rate"])
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Account return", _format_percent(_backtest_total_return(report)), help="Simulated account change after position sizing, stop/target exits, slippage, and commission.")
+    c6.metric("Win rate", _format_percent(float(getattr(report, "win_rate", 0.0))), help=HELP_TEXT["backtest_win_rate"])
+    c7.metric("Max drawdown", _format_percent(float(getattr(report, "max_drawdown", 0.0))), help=HELP_TEXT["drawdown"])
+    c8.metric("Sharpe-like", f"{float(getattr(report, 'sharpe_like', 0.0)):.2f}", help=HELP_TEXT["backtest_sharpe_like"])
+    st.caption(f"Historical range: {getattr(report, 'start', '-') or '-'} to {getattr(report, 'end', '-') or '-'}")
+    for level, message in _backtest_interpretation_messages(report):
+        getattr(st, level)(message)
+    symbol_stats = list(getattr(report, "symbol_stats", []) or [])
+    if symbol_stats:
+        st.subheader("Coverage By Symbol")
+        st.dataframe(pd.DataFrame(symbol_stats), width="stretch", hide_index=True)
     if report.equity_curve:
+        st.subheader("Simulated Account Curve")
+        st.caption("The line moves only when a simulated trade closes. Flat sections mean the strategy stayed out.")
         equity_df = pd.DataFrame(report.equity_curve)
         st.line_chart(equity_df.set_index("date")["equity"])
+    trade_rows = _backtest_trade_rows(report)
+    if trade_rows:
+        st.subheader("Executed Trade Outcomes")
+        trade_log_df = _percent_display(
+            pd.DataFrame(trade_rows),
+            ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
+        )
+        st.dataframe(trade_log_df, width="stretch", hide_index=True, column_config=_trade_log_column_config())
+    skip_rows = _backtest_skip_reason_rows(report)
+    if skip_rows:
+        with _remembered_expander("Why Setups Were Skipped", "backtest_skip_reasons", expanded=True):
+            st.write("A high skip count is not automatically a failure. It shows which gates reject entries most often.")
+            st.dataframe(pd.DataFrame(skip_rows), width="stretch", hide_index=True)
     if report.trade_log:
-        with _remembered_expander("Trade Log", "backtest_trade_log", expanded=True):
+        with _remembered_expander("Full Evaluation Log", "backtest_trade_log", expanded=False):
+            st.caption("Detailed audit trail for every historical evaluation, including skipped setups.")
             trade_log_df = _percent_display(
                 pd.DataFrame(report.trade_log),
                 ["return", "trade_return", "confidence", "max_adverse_excursion", "max_favorable_excursion"],
             )
             st.dataframe(trade_log_df, width="stretch", hide_index=True, column_config=_trade_log_column_config())
+
+
+def _backtest_settings_for_depth(settings: Settings, depth: str) -> Settings:
+    profile = _BACKTEST_DEPTH_PRESETS.get(depth, _BACKTEST_DEPTH_PRESETS["Standard review"])
+    raw = deepcopy(settings.raw)
+    raw.setdefault("data", {})["period"] = profile["period"]
+    raw.setdefault("backtest", {}).update(
+        {
+            "lookback_rows": profile["lookback_rows"],
+            "holding_period_days": profile["holding_period_days"],
+            "evaluation_step_days": profile["evaluation_step_days"],
+        }
+    )
+    return Settings(raw=raw, path=settings.path)
+
+
+def _backtest_total_return(report) -> float:
+    configured = getattr(report, "total_return", None)
+    if configured is not None:
+        return float(configured)
+    curve = list(getattr(report, "equity_curve", []) or [])
+    initial = float(getattr(report, "initial_capital", 0.0) or 0.0)
+    if not curve or not initial:
+        return 0.0
+    return (float(curve[-1]["equity"]) / initial) - 1
+
+
+def _backtest_interpretation_messages(report) -> list[tuple[str, str]]:
+    evaluations = int(getattr(report, "evaluations", 0))
+    trades = int(getattr(report, "trades", 0))
+    no_trade_rate = float(getattr(report, "no_trade_rate", 0.0))
+    messages: list[tuple[str, str]] = []
+    if evaluations == 0:
+        return [("error", "No historical evaluations were produced. Choose a longer simulation depth or verify that the market-data provider returned enough daily bars.")]
+    if trades == 0:
+        messages.append(("warning", "No simulated trades passed the configured gates. This is a useful diagnostic, not a performance result. Review the skip reasons below or run a deeper sample."))
+    elif trades < 10:
+        messages.append(("warning", f"Only {trades} simulated trade{'s' if trades != 1 else ''} passed the gates. The sample is too small for performance conclusions; use the outcomes to inspect logic only."))
+    else:
+        messages.append(("info", f"{trades} simulated trades passed the gates. Read account return together with drawdown, skip reasons, and individual outcomes."))
+    if no_trade_rate >= 0.90:
+        messages.append(("info", f"The strategy skipped {no_trade_rate:.0%} of evaluations. That can be appropriate for a selective strategy, but inspect the dominant skip reasons to confirm the gates are not overly restrictive."))
+    messages.append(("caption", "Backtests can expose weak logic and unrealistic assumptions. They cannot establish that a strategy will remain profitable in live trading."))
+    return messages
+
+
+def _backtest_trade_rows(report) -> list[dict]:
+    return [
+        row
+        for row in list(getattr(report, "trade_log", []) or [])
+        if str(row.get("exit_reason", "")) not in {"no_trade", "session_blocked"}
+    ]
+
+
+def _backtest_skip_reason_rows(report) -> list[dict[str, str | int]]:
+    counts: dict[str, int] = {}
+    for row in list(getattr(report, "trade_log", []) or []):
+        if str(row.get("exit_reason", "")) not in {"no_trade", "session_blocked"}:
+            continue
+        reason = str(row.get("skip_reasons") or row.get("top_reason") or "unspecified")
+        counts[reason] = counts.get(reason, 0) + 1
+    return [
+        {"skip_reason": reason, "evaluations": count}
+        for reason, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
 
 
 def _render_settings_tab(settings, symbols: list[str]) -> None:
@@ -1824,7 +2350,9 @@ def _format_scanner_value(key: str, value) -> str:
 def _scanner_column_config(compact: bool = False) -> dict:
     config = {
         "symbol": st.column_config.TextColumn("Symbol", width="small", help="Ticker being evaluated."),
-        "action": st.column_config.TextColumn("Action", width="small", help=HELP_TEXT["action"]),
+        "bias": st.column_config.TextColumn("Bias", width="small", help=HELP_TEXT["bias"]),
+        "signal_action": st.column_config.TextColumn("Signal", width="small", help="Directional signal before calendar and risk execution gates."),
+        "action": st.column_config.TextColumn("Trade Action", width="small", help=HELP_TEXT["action"]),
         "price": st.column_config.NumberColumn("Price", format="$%.2f", help="Latest price used by the scanner row."),
         "change_pct": st.column_config.NumberColumn("Change", format="%.2f%%", help="Current percent move. Large moves can create opportunity, but also late-entry risk."),
         "volume_anomaly": st.column_config.NumberColumn("RVOL", format="%.2f", help="Relative volume. Above 1.0 means volume is above recent average."),
@@ -1849,6 +2377,7 @@ def _scanner_column_config(compact: bool = False) -> dict:
     if compact:
         compact_keys = {
             "symbol",
+            "bias",
             "action",
             "rank_score",
             "confidence",

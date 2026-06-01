@@ -12,7 +12,7 @@ import yaml
 from stockpredictor.backtesting import _excursions, _simulate_exit, run_backtest
 from stockpredictor.config import load_settings
 from stockpredictor.context import build_context_summary
-from stockpredictor.contracts import ContextSummary, FeatureSet, ModelPrediction, SignalDecision
+from stockpredictor.contracts import CalendarContext, ContextSummary, FeatureSet, ModelPrediction, SignalDecision
 from stockpredictor.data import FallbackProvider, SyntheticProvider, _period_to_rows
 from stockpredictor.features import build_feature_set
 from stockpredictor.journal import append_journal_entry, load_journal_entries
@@ -41,6 +41,18 @@ def test_default_config_loads() -> None:
     settings = load_settings("configs/default.example.yaml")
     assert "baseline" in settings.enabled_models()
     assert settings.watchlist()
+
+
+def test_horizon_fallbacks_keep_swing_and_position_vwap_guards(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("configs/default.example.yaml").read_text(encoding="utf-8"))
+    raw.pop("horizons", None)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    settings = load_settings(config_path)
+
+    assert settings.horizon_profile("swing")["max_entry_distance_from_vwap_pct"] == pytest.approx(0.60)
+    assert settings.horizon_profile("position")["max_entry_distance_from_vwap_pct"] == pytest.approx(1.00)
 
 
 def test_models_enabled_list_is_the_only_disable_mechanism(tmp_path: Path) -> None:
@@ -73,6 +85,29 @@ def test_disabled_features_are_not_calculated(tmp_path: Path) -> None:
     assert "vwap" in features.indicators
     assert "rsi" not in features.indicators
     assert "macd" not in features.indicators
+
+
+def test_daily_volume_weighted_average_uses_recent_rolling_window(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path)
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    raw["features"]["enabled"] = ["vwap"]
+    raw["features"]["vwap_window"] = 3
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    frame = pd.DataFrame(
+        {
+            "Open": [100, 100, 100, 10, 20, 30],
+            "High": [100, 100, 100, 10, 20, 30],
+            "Low": [100, 100, 100, 10, 20, 30],
+            "Close": [100, 100, 100, 10, 20, 30],
+            "Volume": [1, 1, 1, 1, 1, 1],
+        },
+        index=pd.date_range("2026-01-01", periods=6, freq="D"),
+    )
+
+    features = build_feature_set("TEST", frame, settings)
+
+    assert features.indicators["vwap"] == pytest.approx(20.0)
 
 
 def _trend_frame(values) -> pd.DataFrame:
@@ -346,6 +381,53 @@ def test_zero_model_weight_disables_disagreement_penalties_and_uses_ai_confidenc
     assert "model disagreement reduced confidence" not in decision.reasons
 
 
+def test_closed_market_preserves_swing_setup_and_marks_execution_wait(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    raw = yaml.safe_load(settings.path.read_text(encoding="utf-8"))
+    ai_weights = {"models": 0.0, "technicals": 0.0, "intraday": 0.0, "context": 0.8, "sentiment": 0.2}
+    raw["signal_fusion"]["weights"] = dict(ai_weights)
+    raw["horizons"]["profiles"]["swing"]["weights"] = dict(ai_weights)
+    settings.path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    settings = load_settings(settings.path)
+    context = ContextSummary(
+        symbol="TEST",
+        enabled=True,
+        score=0.8,
+        sentiment="bullish",
+        features={"news_stance_score": 0.8, "context_confidence": 0.8},
+    )
+    calendar = CalendarContext(
+        symbol="TEST",
+        as_of="2026-01-01T20:00:00-05:00",
+        market_session="closed_overnight",
+        no_trade_flags=["market is currently closed"],
+    )
+
+    decision = fuse_signals("TEST", _bullish_features(), [_bullish_prediction()], context, settings, calendar_context=calendar)
+
+    assert decision.bias == "bullish"
+    assert decision.signal_action == "long"
+    assert decision.action == "long"
+    assert decision.execution_blockers == ["market is currently closed"]
+
+
+def test_closed_market_blocks_intraday_execution_but_preserves_signal(tmp_path: Path) -> None:
+    settings = _test_settings(tmp_path, enabled_models=["baseline"])
+    context = ContextSummary(symbol="TEST", enabled=True, score=0.5, sentiment="bullish")
+    calendar = CalendarContext(
+        symbol="TEST",
+        as_of="2026-01-01T20:00:00-05:00",
+        market_session="closed_overnight",
+        no_trade_flags=["market is currently closed"],
+    )
+
+    decision = fuse_signals("TEST", _bullish_features(), [_bullish_prediction()], context, settings, horizon="intraday", calendar_context=calendar)
+
+    assert decision.signal_action == "long"
+    assert decision.action == "no_trade"
+    assert decision.execution_blockers == ["market is currently closed"]
+
+
 def test_risk_plan_for_actionable_long(tmp_path: Path) -> None:
     settings = _test_settings(tmp_path)
     frame = SyntheticProvider().fetch("TEST", "6mo", "1d")
@@ -568,13 +650,20 @@ def test_analyze_scan_and_backtest_with_synthetic_data(tmp_path: Path) -> None:
     assert len(scan) == 2
     assert all("rank_score" in result.scanner_row for result in scan)
 
-    report = run_backtest(settings, symbols=["AAA"], provider=provider)
+    progress_updates = []
+    report = run_backtest(settings, symbols=["AAA"], provider=provider, progress_callback=lambda value, message: progress_updates.append((value, message)))
     assert report.symbols == ["AAA"]
     assert report.trades >= 0
     assert 0 <= report.no_trade_rate <= 1
     assert report.evaluations > 0
     assert report.trade_log
     assert "setup_quality" in report.trade_log[0]
+    assert report.initial_capital == 100000
+    assert report.final_equity > 0
+    assert report.symbol_stats[0]["symbol"] == "AAA"
+    assert report.symbol_stats[0]["evaluations"] == report.evaluations
+    assert progress_updates[-1] == (1.0, "Completed AAA")
+    assert [value for value, _ in progress_updates] == sorted(value for value, _ in progress_updates)
 
 
 def test_synthetic_analysis_skips_live_market_enrichment(tmp_path: Path, monkeypatch) -> None:
@@ -767,6 +856,38 @@ def test_session_context_from_synthetic_intraday(tmp_path: Path) -> None:
     # synthetic frame anchored to today's regular session in UTC translated to ET; session VWAP
     # must compute to a real number whenever bars are loaded.
     assert session.session_vwap is not None or session.session_open is not None
+
+
+def test_stale_intraday_reference_is_not_exposed_as_live_price(tmp_path: Path, monkeypatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from stockpredictor.session import build_session_context
+
+    settings = _test_settings(tmp_path)
+    monkeypatch.setattr(
+        "stockpredictor.session._now_market",
+        lambda tz_name: datetime(2026, 6, 1, 12, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+    index = pd.date_range("2026-05-29 09:30", periods=3, freq="min", tz="America/New_York")
+    frame = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0, 102.0],
+            "High": [101.0, 102.0, 103.0],
+            "Low": [99.0, 100.0, 101.0],
+            "Close": [100.5, 101.5, 102.5],
+            "Volume": [1000.0, 1200.0, 1300.0],
+        },
+        index=index,
+    )
+
+    session = build_session_context("TEST", frame, settings)
+
+    assert session.is_live is False
+    assert session.session_date == "2026-05-29"
+    assert session.live_price is None
+    assert session.reference_price == 102.5
+    assert session.time_of_day_rvol is None
 
 
 def test_horizon_profile_overrides_atr_multiple(tmp_path: Path) -> None:
