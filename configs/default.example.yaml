@@ -211,6 +211,7 @@ dashboard:
   default_symbol: AAPL
   default_watchlist: default
   max_scan_symbols: 10
+  education_mode: true   # beginner-friendly mode: glossary, per-screen guides, and "how traders use it" notes on every tooltip (toggle live in the sidebar)
   result_cache:
     enabled: true
     path: data/dashboard_state.local.pkl

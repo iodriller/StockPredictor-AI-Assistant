@@ -12,6 +12,7 @@ import streamlit as st
 from stockpredictor.backtesting import run_backtest
 from copy import deepcopy
 
+from stockpredictor import education as edu
 from stockpredictor.config import ConfigError, Settings, load_settings
 from stockpredictor.data import fetch_market_data, get_market_data_provider
 from stockpredictor.dashboard_cache import CACHE_KEYS, load_dashboard_cache, save_dashboard_cache
@@ -21,13 +22,14 @@ from stockpredictor.journal import (
     load_journal_entries,
     update_journal_entry,
 )
+from stockpredictor.models.registry import MODEL_REGISTRY
 from stockpredictor.news import NewsAnalysisError, build_news_feed
 from stockpredictor.pipeline import analyze_symbol, scan_symbols
 from stockpredictor.symbols import normalize_symbol, search_symbols
 from stockpredictor.utils import clean_symbol_list, to_float, to_serializable
 
 
-HELP_TEXT = {
+_HELP_BASE = {
     "action": "The fused decision from models, technicals, context, and risk checks. Treat watch/no-trade/low-confidence as valid outcomes, not failures.",
     "analysis_provider": "Shows whether news summaries came from the configured LLM, heuristic fallback, or heuristic-only mode.",
     "article_excerpts": "Short excerpts fetched from source links and passed to the LLM. This improves context but is not a full professional news feed.",
@@ -68,6 +70,44 @@ HELP_TEXT = {
 }
 
 
+# Education-mode state. When on, every tooltip is enriched with a "how traders use
+# it" line, and the workspaces show beginner guides + a glossary. This module-level
+# flag is set once per render in main(), so the wrapper below needs no plumbing.
+_EDU_STATE = {"on": False}
+
+
+def _education_on() -> bool:
+    return bool(_EDU_STATE.get("on"))
+
+
+class _EducationalHelp:
+    """Drop-in replacement for the HELP_TEXT dict whose lookups gain a trader-usage
+    line when education mode is on — so every existing `help=HELP_TEXT[...]` call
+    becomes beginner-friendly with no change at the call site."""
+
+    def __init__(self, base: dict[str, str]) -> None:
+        self._base = base
+
+    def __getitem__(self, key: str) -> str:
+        return edu.enrich_help(key, self._base[key], _education_on())
+
+    def get(self, key: str, default: str = "") -> str:
+        base = self._base.get(key, default)
+        return edu.enrich_help(key, base, _education_on()) if base else base
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._base
+
+    def __iter__(self):
+        return iter(self._base)
+
+    def keys(self):
+        return self._base.keys()
+
+
+HELP_TEXT = _EducationalHelp(_HELP_BASE)
+
+
 def _remembered_expander(label: str, state_key: str, expanded: bool = False, container=None):
     container = container or st
     expander_key = f"expander_{_slug_key(state_key)}"
@@ -97,13 +137,16 @@ def _install_expander_memory() -> None:
             doc.querySelectorAll('[class*="st-key-expander_"]').forEach((wrapper) => {
               const details = wrapper.matches("details") ? wrapper : wrapper.querySelector("details");
               if (!details) return;
+              // Only ever touch an expander once. Re-applying details.open on every
+              // DOM mutation fights Streamlit's own re-render and causes flicker
+              // (most visible on heavy panels like the glossary).
+              if (details.dataset.stockpredictorMemoryBound === "true") return;
               const panelClass = [...wrapper.classList].find((name) => name.startsWith("st-key-expander_"));
               if (!panelClass) return;
+              details.dataset.stockpredictorMemoryBound = "true";
               if (Object.prototype.hasOwnProperty.call(state, panelClass)) {
                 details.open = Boolean(state[panelClass]);
               }
-              if (details.dataset.stockpredictorMemoryBound === "true") return;
-              details.dataset.stockpredictorMemoryBound = "true";
               details.addEventListener("toggle", () => {
                 const latest = loadState();
                 latest[panelClass] = details.open;
@@ -112,7 +155,15 @@ def _install_expander_memory() -> None:
             });
           };
           bind();
-          new MutationObserver(bind).observe(doc.body, { childList: true, subtree: true });
+          // Debounce so a burst of mutations only triggers one (cheap) pass that
+          // binds newly added expanders, rather than thrashing on every change.
+          let scheduled = false;
+          const observer = new MutationObserver(() => {
+            if (scheduled) return;
+            scheduled = true;
+            window.parent.requestAnimationFrame(() => { scheduled = false; bind(); });
+          });
+          observer.observe(doc.body, { childList: true, subtree: true });
         })();
         </script>
         """,
@@ -140,6 +191,7 @@ def main() -> None:
         st.error(str(exc))
         return
 
+    _render_education_toggle(settings)
     symbols = _render_symbol_sidebar(settings)
     _initialize_dashboard_cache(settings)
     workspace = st.segmented_control(
@@ -149,6 +201,15 @@ def main() -> None:
         key="dashboard_workspace",
         help="Choose one workflow. Only the active workspace runs, which keeps interactions responsive.",
     ) or "Scanner"
+    workspace_guide_keys = {
+        "Scanner": "scanner",
+        "Trade Plan": "trade_plan",
+        "News": "news",
+        "Backtest": "backtest",
+        "Journal": "journal",
+        "Settings": "settings",
+    }
+    _render_education_guide(workspace_guide_keys.get(workspace, ""))
     if workspace == "Scanner":
         _render_scanner(settings, symbols)
     elif workspace == "Trade Plan":
@@ -161,7 +222,56 @@ def main() -> None:
         _render_journal(settings, symbols)
     elif workspace == "Settings":
         _render_settings_tab(settings, symbols)
+    _render_education_glossary()
     _install_expander_memory()
+
+
+def _render_education_toggle(settings) -> None:
+    """Sidebar switch for Education mode. Defaults to the config value, then the
+    user can flip it live; the choice drives every tooltip and guide in the app."""
+    default_on = bool(settings.dashboard.get("education_mode", True))
+    if "education_mode" not in st.session_state:
+        st.session_state.education_mode = default_on
+    st.sidebar.toggle(
+        "📚 Education mode",
+        key="education_mode",
+        help="Beginner-friendly mode: adds plain-language explanations, a glossary of every term, per-screen guides, and 'how traders use this' notes on every tooltip.",
+    )
+    _EDU_STATE["on"] = bool(st.session_state.education_mode)
+    if _EDU_STATE["on"]:
+        st.sidebar.caption("Learning aids are ON. Hover any ⓘ for a plain-language note.")
+
+
+def _render_education_guide(guide_key: str) -> None:
+    if not _education_on() or guide_key not in edu.WORKSPACE_GUIDES:
+        return
+    guide = edu.WORKSPACE_GUIDES[guide_key]
+    with st.container(border=True):
+        st.markdown(f"#### 📚 {guide['title']}")
+        st.write(guide["what"])
+        if guide.get("look_at"):
+            st.markdown("**What to look at:** " + " · ".join(guide["look_at"]))
+        if guide.get("steps"):
+            st.markdown("**Steps:**")
+            for index, step in enumerate(guide["steps"], start=1):
+                st.markdown(f"{index}. {step}")
+
+
+def _render_education_glossary() -> None:
+    if not _education_on():
+        return
+    with _remembered_expander("📖 Glossary — every term in one place", "education_glossary", expanded=False):
+        st.caption("Plain-language one-liners for every symbol, acronym, and metric in the app.")
+        df = pd.DataFrame(edu.glossary_groups(), columns=["term", "meaning"])
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "term": st.column_config.TextColumn("Term", width="small"),
+                "meaning": st.column_config.TextColumn("What it means (and how it's used)", width="large"),
+            },
+        )
 
 
 def _render_trade_plan_workspace(settings, symbols: list[str]) -> None:
@@ -171,6 +281,8 @@ def _render_trade_plan_workspace(settings, symbols: list[str]) -> None:
     horizon_options = list((settings.horizons.get("profiles") or {"swing": {}}).keys()) or ["swing"]
     default_horizon = settings.horizons.get("default", "swing")
     selected_horizon = _render_horizon_selector(col_horizon, horizon_options, str(default_horizon))
+    if _education_on() and selected_horizon in edu.HORIZON_GUIDES:
+        st.caption(f"📚 {edu.HORIZON_GUIDES[selected_horizon]}")
     default_news_limit = int(settings.context_agent.get("news_analysis", {}).get("max_headlines_per_symbol", 50))
     news_limit = st.slider(
         "Headlines to analyze",
@@ -276,44 +388,138 @@ _MODELS_DISCLAIMER = (
 
 
 def _render_tuning_controls(settings, horizon: str) -> "Settings":
-    """Expose the key model/signal parameters as live controls so a trader can tune
-    the analysis without editing the config file. Returns a Settings with the
-    overrides applied (base weights and the active horizon profile's weights, plus
-    thresholds, MA windows, and the trade confidence gate)."""
-    with _remembered_expander("Model & signal tuning", "deepdive_tuning", expanded=False):
-        st.caption("Overrides apply to this analysis only. Defaults come from the config file; clear them by resetting the values.")
-        ma_default = ",".join(str(int(value)) for value in settings.features.get("ma_windows", [9, 20, 50]))
-        ma_text = st.text_input("Moving-average windows", value=ma_default, help="Comma-separated lookbacks for the trend/MA features and chart, e.g. 9,20,50.")
+    """Expose the model/signal/LLM parameters as live controls so a trader can tune
+    the analysis without editing the config file. Returns a Settings with all the
+    overrides applied. Rendered as sibling expanders (never nested)."""
+    new_raw = deepcopy(settings.raw)
+    base_weights = _resolve_active_weights(settings, horizon)
 
-        weights = _resolve_active_weights(settings, horizon)
-        st.caption("Signal weights (auto-normalized). These set how much each input drives the fused score.")
-        wc = st.columns(5)
-        w_models = wc[0].number_input("Models", 0.0, 1.0, float(weights.get("models", 0.4)), 0.05, help="Weight of the ML model forecasts.")
-        w_tech = wc[1].number_input("Technicals", 0.0, 1.0, float(weights.get("technicals", 0.35)), 0.05, help="Weight of trend/VWAP/MA/MACD/RSI signals.")
-        w_intra = wc[2].number_input("Intraday", 0.0, 1.0, float(weights.get("intraday", 0.0)), 0.05, help="Weight of intraday session signals (matters most for the intraday horizon).")
-        w_ctx = wc[3].number_input("Context/News", 0.0, 1.0, float(weights.get("context", 0.2)), 0.05, help="Weight of the news/context catalyst score.")
-        w_sent = wc[4].number_input("Sentiment", 0.0, 1.0, float(weights.get("sentiment", 0.05)), 0.05, help="Weight of the news sentiment tilt.")
+    overrides_weights = _render_trust_and_thresholds(settings, base_weights, new_raw)
+    _apply_weight_overrides(new_raw, horizon, overrides_weights)
+    _render_model_controls(settings, new_raw)
+    _render_llm_controls(settings, new_raw)
+    return Settings(raw=new_raw, path=settings.path)
+
+
+def _render_trust_and_thresholds(settings, base_weights: dict, new_raw: dict) -> dict:
+    """The comfortable single dial: how much to trust the ML models vs the News/AI
+    read, plus the decision thresholds. Returns the new weight dict."""
+    ml = float(base_weights.get("models", 0.4))
+    ai = float(base_weights.get("context", 0.2)) + float(base_weights.get("sentiment", 0.05))
+    technicals = float(base_weights.get("technicals", 0.35))
+    intraday = float(base_weights.get("intraday", 0.0))
+    budget = ml + ai
+    default_trust = int(round((ai / budget) * 100)) if budget > 0 else 40
+
+    with _remembered_expander("🎚️ Trust & decision thresholds", "deepdive_trust", expanded=False):
+        st.caption("Move the dial toward what you trust more for this stock. Technical signals keep their weight.")
+        trust = st.slider(
+            "Trust balance",
+            min_value=0,
+            max_value=100,
+            value=default_trust,
+            step=5,
+            help="0 = trust the ML price models; 100 = trust the News/AI read. It rebalances how much each side drives the fused score.",
+            format="%d%% News/AI",
+        )
+        t = trust / 100.0
+        models_w = budget * (1.0 - t)
+        context_w = budget * t * 0.8
+        sentiment_w = budget * t * 0.2
+        weights = {"models": models_w, "technicals": technicals, "intraday": intraday, "context": context_w, "sentiment": sentiment_w}
+        total = sum(weights.values()) or 1.0
+        st.caption(
+            "Resulting blend → "
+            + " · ".join(f"{name} {value / total:.0%}" for name, value in weights.items())
+        )
+
+        ma_default = ",".join(str(int(value)) for value in settings.features.get("ma_windows", [9, 20, 50]))
+        ma_text = st.text_input("Moving-average windows", value=ma_default, help="Comma-separated lookbacks for the trend/MA features and chart, e.g. 9,20,50 (fast, medium, slow).")
 
         thresholds = settings.signal_fusion.get("thresholds", {})
         tc = st.columns(3)
         long_score = tc[0].slider("Trade score", 0.10, 0.80, float(thresholds.get("long_score", 0.35)), 0.01, help="Score magnitude needed to call a directional (long/short) trade. Lower = more trades, lower selectivity.")
-        watch_score = tc[1].slider("Watch score", 0.05, 0.50, float(thresholds.get("watch_score", 0.18)), 0.01, help="Score magnitude needed to flag a watch.")
+        watch_score = tc[1].slider("Watch score", 0.05, 0.50, float(thresholds.get("watch_score", 0.18)), 0.01, help="Score magnitude needed to flag a watch (worth keeping an eye on).")
         min_conf_trade = tc[2].slider("Min confidence to trade", 0.10, 0.80, float(settings.risk.get("min_confidence_for_trade", 0.40)), 0.01, help="Risk-layer confidence gate. Lower = more trades, lower quality.")
 
     parsed_windows = [int(part) for part in ma_text.replace(" ", "").split(",") if part.strip().isdigit()]
-    overrides_weights = {"models": w_models, "technicals": w_tech, "intraday": w_intra, "context": w_ctx, "sentiment": w_sent}
-    new_raw = deepcopy(settings.raw)
     new_raw.setdefault("features", {})["ma_windows"] = parsed_windows or settings.features.get("ma_windows", [9, 20, 50])
     sf = new_raw.setdefault("signal_fusion", {})
-    sf.setdefault("weights", {}).update(overrides_weights)
     sf.setdefault("thresholds", {}).update({"long_score": long_score, "short_score": -abs(long_score), "watch_score": watch_score})
     new_raw.setdefault("risk", {})["min_confidence_for_trade"] = min_conf_trade
+    return weights
+
+
+def _apply_weight_overrides(new_raw: dict, horizon: str, weights: dict) -> None:
+    new_raw.setdefault("signal_fusion", {}).setdefault("weights", {}).update(weights)
     # The active horizon profile's weights win over base weights in fusion, so apply
-    # the override there too — otherwise editing weights would have no effect.
+    # the override there too — otherwise the trust dial would have no effect.
     profiles = new_raw.setdefault("horizons", {}).setdefault("profiles", {})
-    if horizon in profiles and isinstance(profiles[horizon], dict) and "weights" in profiles[horizon]:
-        profiles[horizon]["weights"].update(overrides_weights)
-    return Settings(raw=new_raw, path=settings.path)
+    profile = profiles.get(horizon)
+    if isinstance(profile, dict) and isinstance(profile.get("weights"), dict):
+        profile["weights"].update(weights)
+
+
+def _render_model_controls(settings, new_raw: dict) -> None:
+    """Choose which models run and tune their hyperparameters, over the air."""
+    available = list(MODEL_REGISTRY.keys())
+    enabled_default = [name for name in settings.enabled_models() if name in available] or available
+    with _remembered_expander("🤖 Models & hyperparameters", "deepdive_models", expanded=False):
+        st.caption("Pick the models that vote on the forecast and tune each one. More models = more confirmation but slower.")
+        enabled = st.multiselect("Active models", options=available, default=enabled_default, help="Which prediction models contribute to the blended forecast.")
+        models_cfg = new_raw.setdefault("models", {})
+        models_cfg["enabled"] = enabled or enabled_default
+
+        if "momentum" in enabled:
+            cont = float(settings.models.get("momentum", {}).get("continuation_factor", 0.6))
+            value = st.slider("Momentum · continuation factor", 0.1, 1.0, cont, 0.05, help="How much of recent realized momentum is projected forward. Higher = more trend-following.")
+            models_cfg.setdefault("momentum", {})["continuation_factor"] = value
+        if "baseline" in enabled:
+            decay = float(settings.models.get("baseline", {}).get("recency_decay", 5.0))
+            value = st.slider("Baseline · recency emphasis", 0.0, 10.0, decay, 0.5, help="How strongly the trend fit weights recent bars over old history. Higher = reacts faster to reversals.")
+            models_cfg.setdefault("baseline", {})["recency_decay"] = value
+        if "gaussian_process" in enabled:
+            gp = settings.models.get("gaussian_process", {})
+            cols = st.columns(2)
+            kernel = cols[0].selectbox("GP · kernel", ["matern", "rbf"], index=0 if str(gp.get("kernel", "matern")) == "matern" else 1, help="Smoothness assumption for the drift estimate. Matern is a bit rougher/more reactive than RBF.")
+            train_rows = cols[1].number_input("GP · max train rows", 30, 500, int(gp.get("max_train_rows", 160)), 10, help="How many recent bars the Gaussian Process learns from.")
+            models_cfg.setdefault("gaussian_process", {}).update({"kernel": kernel, "max_train_rows": int(train_rows)})
+        if "arima" in enabled:
+            order = list(settings.models.get("arima", {}).get("order", [1, 1, 1]))
+            cols = st.columns(3)
+            p = cols[0].number_input("ARIMA · p (AR)", 0, 5, int(order[0]) if len(order) > 0 else 1, 1, help="Auto-regressive terms: how many past values feed the forecast.")
+            d = cols[1].number_input("ARIMA · d (diff)", 0, 2, int(order[1]) if len(order) > 1 else 1, 1, help="Differencing: how many times the series is de-trended before fitting.")
+            q = cols[2].number_input("ARIMA · q (MA)", 0, 5, int(order[2]) if len(order) > 2 else 1, 1, help="Moving-average terms: how many past forecast errors feed the forecast.")
+            models_cfg.setdefault("arima", {})["order"] = [int(p), int(d), int(q)]
+
+
+def _render_llm_controls(settings, new_raw: dict) -> None:
+    """Configure the News AI (LLM) provider in the UI — local on this machine,
+    a cloud API on another — without editing the config file."""
+    llm = settings.context_agent.get("news_analysis", {}).get("llm", {})
+    options = ["localdeploy", "openai", "openai_compatible", "disabled"]
+    current = "disabled" if not llm.get("enabled", False) else str(llm.get("provider", "localdeploy"))
+    if current not in options:
+        options.insert(0, current)
+    with _remembered_expander("🧠 News AI (LLM) settings", "deepdive_llm", expanded=False):
+        st.caption("Which AI summarizes and scores the news. Use a local model on this machine, or a cloud API key on another.")
+        provider = st.selectbox("Provider", options=options, index=options.index(current), help="localdeploy = a local OpenAI-compatible server; openai = the OpenAI API; openai_compatible = any compatible endpoint; disabled = headline keywords only.")
+        cfg = new_raw.setdefault("context_agent", {}).setdefault("news_analysis", {}).setdefault("llm", {})
+        if provider == "disabled":
+            cfg["enabled"] = False
+            st.caption("News will be summarized with simple keyword heuristics only (no AI stance).")
+        else:
+            cfg["enabled"] = True
+            cfg["provider"] = provider
+            model = st.text_input("Model", value=str(llm.get("model", "qwen3vl_8b_ollama")), help="The model name to request from the provider, e.g. qwen3vl_8b_ollama (local) or gpt-5 (OpenAI).")
+            cfg["model"] = model
+            if provider in {"localdeploy", "openai_compatible"}:
+                base_url = st.text_input("Base URL", value=str(llm.get("base_url", "http://127.0.0.1:8100/v1/chat/completions")), help="The chat-completions endpoint of your local/compatible server.")
+                cfg["base_url"] = base_url
+            if provider == "openai":
+                api_key_env = st.text_input("API key env var", value=str(llm.get("api_key_env", "OPENAI_API_KEY")), help="Name of the environment variable that holds your OpenAI API key. The key itself is never entered here.")
+                cfg["api_key_env"] = api_key_env
+            cfg["fallback_to_heuristic"] = st.toggle("Fall back to keywords if the AI is unavailable", value=bool(llm.get("fallback_to_heuristic", True)), help="If on, a failed AI call quietly falls back to keyword summaries instead of erroring.")
 
 
 def _resolve_active_weights(settings, horizon: str) -> dict:
@@ -439,13 +645,27 @@ def _scanner_detail_label(row: dict) -> str:
 
 def _render_analysis(settings, symbol: str, horizon: str | None = None, news_limit: int | None = None, refresh: bool = True) -> None:
     if refresh:
-        progress = st.progress(0, text=f"Starting {symbol} analysis")
-        progress.progress(0.15, text=f"Running signal, context, and risk checks for {symbol}")
-        result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit)
-        progress.progress(0.75, text=f"Loading chart history for {symbol}")
+        import time
+
+        last_durations = st.session_state.setdefault("_analyze_durations", {})
+        prior = last_durations.get("last")
+        start = time.monotonic()
+        hint = f" (last run took ~{prior:.0f}s)" if prior else " (news AI summaries can take ~10–60s on first run)"
+        progress = st.progress(0.0, text=f"Starting {symbol} analysis…{hint}")
+
+        def on_progress(fraction: float, message: str) -> None:
+            elapsed = time.monotonic() - start
+            eta = (elapsed / fraction) * (1.0 - fraction) if fraction > 0.02 else None
+            suffix = f" · ~{eta:.0f}s left" if eta and eta >= 1 else ""
+            progress.progress(min(max(fraction, 0.0), 1.0), text=f"{message}…{suffix}")
+
+        result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit, progress_callback=on_progress)
+        on_progress(0.97, f"Loading chart history for {symbol}")
         provider = get_market_data_provider(settings)
         frame = fetch_market_data(symbol, settings, provider)
-        progress.progress(1.0, text=f"{symbol} analysis ready")
+        elapsed = time.monotonic() - start
+        last_durations["last"] = elapsed
+        progress.progress(1.0, text=f"{symbol} analysis ready in {elapsed:.0f}s")
         st.session_state.latest_analysis = {"result": result, "frame": frame}
         _persist_dashboard_cache(settings)
     else:
@@ -546,20 +766,20 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
     with _remembered_expander("Model Details", "analysis_model_details", expanded=False):
         model_df = _percent_display(pd.DataFrame([asdict(prediction) for prediction in result.predictions]), ["expected_return", "confidence"])
         st.dataframe(model_df, width="stretch", hide_index=True, column_config=_model_column_config())
-        notes = [
-            {"model": prediction.model, "what it is": _MODEL_NOTES.get(prediction.model, "Model forecast.")}
-            for prediction in result.predictions
-        ]
+        notes = []
+        for prediction in result.predictions:
+            guide = edu.MODEL_GUIDES.get(prediction.model, {})
+            note = {"model": prediction.model, "what it is": guide.get("what", _MODEL_NOTES.get(prediction.model, "Model forecast."))}
+            if _education_on() and guide.get("why"):
+                note["why it's used"] = guide["why"]
+            notes.append(note)
         if notes:
-            st.dataframe(
-                pd.DataFrame(notes),
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "model": st.column_config.TextColumn("Model", help="Prediction model."),
-                    "what it is": st.column_config.TextColumn("What it is / limits", help="Plain-language description of the model and what it is good and bad at."),
-                },
-            )
+            columns = {
+                "model": st.column_config.TextColumn("Model", help="Prediction model."),
+                "what it is": st.column_config.TextColumn("What it is / limits", help="Plain-language description of the model and what it is good and bad at."),
+                "why it's used": st.column_config.TextColumn("Why it's used", help="What this model contributes to the blended forecast."),
+            }
+            st.dataframe(pd.DataFrame(notes), width="stretch", hide_index=True, column_config=columns)
         st.caption(_MODELS_DISCLAIMER)
 
     with _remembered_expander("Full Signal / Risk Data", "analysis_full_signal_risk", expanded=False):

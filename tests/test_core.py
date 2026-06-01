@@ -22,6 +22,21 @@ from stockpredictor.risk import _merge_structural_target, apply_risk_controls
 from stockpredictor.signals import fuse_signals
 
 
+def test_education_help_enrichment_and_glossary() -> None:
+    from stockpredictor import education as edu
+
+    base = "A plain tooltip."
+    assert edu.enrich_help("vwap", base, enabled=False) == base
+    enriched = edu.enrich_help("vwap", base, enabled=True)
+    assert enriched.startswith(base) and "💡" in enriched
+    # Keys without a trader-usage note are returned unchanged even when enabled.
+    assert edu.enrich_help("does_not_exist", base, enabled=True) == base
+    # The glossary covers a broad set of terms and is alphabetized.
+    groups = edu.glossary_groups()
+    assert len(groups) > 25
+    assert [term.lower() for term, _ in groups] == sorted(term.lower() for term, _ in groups)
+
+
 def test_default_config_loads() -> None:
     settings = load_settings("configs/default.example.yaml")
     assert "baseline" in settings.enabled_models()

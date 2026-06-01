@@ -38,13 +38,16 @@ def analyze_symbol(
     include_snapshot: bool = True,
     news_limit: int | None = None,
     include_news_analysis: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> AnalysisResult:
     settings = settings or load_settings()
     provider = provider or get_market_data_provider(settings)
     symbol = symbol.upper()
     horizon_name = (horizon or str(settings.horizons.get("default", "swing"))).lower()
+    _notify(progress_callback, 0.05, f"Fetching market data for {symbol}")
     frame = data_frame.copy() if data_frame is not None else fetch_market_data(symbol, settings, provider)
     snapshot = build_snapshot(symbol, frame, settings, getattr(provider, "name", "configured"))
+    _notify(progress_callback, 0.28, "Building indicators (VWAP, RSI, MACD, ATR, trend)")
     features = build_feature_set(symbol, frame, settings)
     if data_frame is None:
         _add_benchmark_features(symbol, frame, features, settings, provider)
@@ -56,6 +59,7 @@ def analyze_symbol(
     intraday_score = 0.0
     intraday_reasons: list[str] = []
     if include_session and data_frame is None:
+        _notify(progress_callback, 0.42, "Reading today's intraday session")
         intraday_frame = fetch_intraday_data(symbol, settings, provider)
         session = build_session_context(symbol, intraday_frame, settings)
         if intraday_frame is not None:
@@ -67,11 +71,13 @@ def analyze_symbol(
     sector_context = None
     calendar_context = None
     if include_market_context and data_frame is None:
+        _notify(progress_callback, 0.55, "Cross-checking market & sector")
         allow_live_enrichment = getattr(provider, "name", "") != "synthetic"
         market_state = build_market_state(settings, provider)
         sector_context = build_sector_context(symbol, settings, provider, include_live_lookup=allow_live_enrichment)
         calendar_context = build_calendar_context(symbol, settings, include_live_sources=allow_live_enrichment)
 
+    _notify(progress_callback, 0.66, "Running price models")
     predictions = run_models(symbol, frame, settings, model_names=model_names, horizon=horizon_name)
     # Deep-dive (live) requests fold the rich news analysis into the decision so the
     # trade plan both uses and shows the gathered news. Scans and backtests skip this
@@ -80,6 +86,7 @@ def analyze_symbol(
     news_enrichment = {"status": "skipped", "reason": "Rich news analysis was not requested for this run."}
     if include_context and include_news_analysis and data_frame is None and _news_in_decision_enabled(settings):
         try:
+            _notify(progress_callback, 0.80, "Summarizing & scoring news with the AI model (slowest step)")
             news_analysis = analyze_symbol_news(symbol, settings, limit=news_limit)
             summary = news_analysis.get("summary", {})
             analysis_provider = str(summary.get("analysis_provider", "unknown"))
@@ -96,6 +103,7 @@ def analyze_symbol(
             news_enrichment = {"status": "unavailable", "error": str(exc)}
     elif not _news_in_decision_enabled(settings):
         news_enrichment = {"status": "disabled", "reason": "Rich news-in-decision analysis is disabled by configuration."}
+    _notify(progress_callback, 0.92, "Fusing the decision and building the risk plan")
     context = build_context_summary(symbol, settings, include_live_sources=include_context, news_analysis=news_analysis)
     decision = fuse_signals(
         symbol,
@@ -140,7 +148,13 @@ def analyze_symbol(
     )
     if include_snapshot and data_frame is None:
         result.snapshot_record = record_snapshot(settings, result, horizon=horizon_name)
+    _notify(progress_callback, 1.0, f"{symbol} analysis ready")
     return result
+
+
+def _notify(progress_callback: ProgressCallback | None, fraction: float, message: str) -> None:
+    if progress_callback is not None:
+        progress_callback(float(fraction), message)
 
 
 def scan_symbols(
