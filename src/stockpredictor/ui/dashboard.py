@@ -469,10 +469,16 @@ _BACKTEST_DEPTH_PRESETS = {
     },
 }
 
-_CHART_RANGE_BARS = {
-    "30 bars": 30,
-    "60 bars": 60,
-    "Full history": None,
+# Trading days per labelled period. The chart frame is always fetched with 2 years
+# of data so every option here is backed by real bars, not just what the analysis
+# window happens to contain.
+_CHART_PERIOD_BARS = {
+    "1 month": 21,
+    "3 months": 63,
+    "6 months": 126,
+    "1 year": 252,
+    "2 years": 504,
+    "All data": None,
 }
 
 _CHART_LEVEL_LABELS = {
@@ -891,11 +897,15 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
         result = analyze_symbol(symbol, settings, horizon=horizon, news_limit=news_limit, progress_callback=on_progress)
         on_progress(0.97, f"Loading chart history for {symbol}")
         provider = get_market_data_provider(settings)
-        frame = fetch_market_data(symbol, settings, provider)
+        # Chart uses 2 years of data so every range option (incl. "1 year") is fully
+        # covered — the analysis period (typically 6mo) would leave older price levels
+        # invisible and confuse users who know the stock traded at higher levels before.
+        chart_frame = _fetch_chart_frame(symbol, settings, provider)
         elapsed = time.monotonic() - start
         last_durations["last"] = elapsed
         progress.progress(1.0, text=f"{symbol} analysis ready in {elapsed:.0f}s")
-        st.session_state.latest_analysis = {"result": result, "frame": frame}
+        frame = chart_frame
+        st.session_state.latest_analysis = {"result": result, "frame": chart_frame}
         _persist_dashboard_cache(settings)
     else:
         latest = st.session_state.get("latest_analysis")
@@ -990,23 +1000,39 @@ def _render_analysis(settings, symbol: str, horizon: str | None = None, news_lim
                 st.caption(f"Previous action: {diff.get('previous_action', '-')} @ {diff.get('previous_timestamp', '-')}")
 
     st.subheader("Chart And Levels")
-    chart_range = st.segmented_control(
-        "Daily chart range",
-        options=list(_CHART_RANGE_BARS),
-        default="30 bars",
-        help="Use 30 bars for the active setup, 60 for swing context, or full history for the broad trend. Candles are unadjusted daily OHLC bars from the configured provider.",
-    )
+    period_options = list(_CHART_PERIOD_BARS.keys())
+    chart_period = st.segmented_control(
+        "Chart period",
+        options=period_options,
+        default="6 months",
+        help="How much price history to display. The analysis always uses the configured analysis window (typically 6 months); this only affects what you see on the chart.",
+    ) or "6 months"
+    visible_bars = _CHART_PERIOD_BARS.get(str(chart_period))
+    sliced = frame.tail(visible_bars).copy() if visible_bars else frame.copy()
+    from_date = sliced.index[0].date() if not sliced.empty else "?"
+    to_date = sliced.index[-1].date() if not sliced.empty else "?"
+    price_lo = sliced["Close"].min() if not sliced.empty else 0
+    price_hi = sliced["Close"].max() if not sliced.empty else 0
     st.caption(
-        f"Source: {result.snapshot.provider} daily OHLC bars through {result.snapshot.as_of}. "
-        "The volume-weighted average is a rolling daily-bar reference; Session VWAP above is the true intraday session anchor when current minute bars are available."
+        f"Showing {len(sliced)} daily bars · {from_date} → {to_date} · "
+        f"Close range {_format_price(price_lo)} – {_format_price(price_hi)} · "
+        f"Source: {result.snapshot.provider} unadjusted OHLC. "
+        "The rolling VWAP line is a multi-day reference; the Session VWAP metric above it is the true intraday anchor."
     )
+    if _education_on():
+        st.caption(
+            "📚 **How to read this chart:** Each candle is one trading day. "
+            "Green = closed higher than it opened (up day); red = closed lower (down day). "
+            "The coloured lines are moving averages (trend smoothers) and the dotted lines are key levels. "
+            "Zoom in or out by selecting a different period above."
+        )
     st.plotly_chart(
         _price_chart(
             frame,
             result.features.levels,
             result.risk_plan,
             ma_windows=settings.features.get("ma_windows", [9, 20, 50]),
-            visible_bars=_CHART_RANGE_BARS.get(str(chart_range), 30),
+            visible_bars=visible_bars,
         ),
         width="stretch",
     )
@@ -1471,6 +1497,23 @@ def _render_context_panel(result) -> None:
         if result.context.risks:
             st.write("Risks")
             st.write(result.context.risks)
+
+
+def _fetch_chart_frame(symbol: str, settings: "Settings", provider) -> pd.DataFrame:
+    """Fetch 2 years of daily bars for the chart display.
+
+    Kept separate from the analysis fetch (which uses the configured period, typically
+    6 months) so the chart can show the full historical context — e.g. when a stock
+    was at $200 six months before the current analysis window, that context is visible.
+    Falls back to the analysis period if the extended fetch fails.
+    """
+    try:
+        raw = deepcopy(settings.raw)
+        raw.setdefault("data", {})["period"] = "2y"
+        chart_settings = Settings(raw=raw, path=settings.path)
+        return fetch_market_data(symbol, chart_settings, provider)
+    except Exception:
+        return fetch_market_data(symbol, settings, provider)
 
 
 def _price_chart(
