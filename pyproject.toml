@@ -26,6 +26,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # Browser UI diagnosis (Streamlit dashboard at :8501): after installing, run: python -m playwright install chromium
+    "playwright>=1.40",
 ]
 
 [project.scripts]

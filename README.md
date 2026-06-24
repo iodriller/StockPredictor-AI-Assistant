@@ -73,6 +73,12 @@ Run tests:
 .\.venv\Scripts\python -m pytest
 ```
 
+Browser-drive the Streamlit dashboard (port 8501) for UI diagnosis:
+
+```powershell
+.\.venv\Scripts\python -m playwright install chromium   # one-time browser download
+```
+
 The module form is preferred on Windows because it does not depend on the user
 Python Scripts directory being on `PATH`.
 
