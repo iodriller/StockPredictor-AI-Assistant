@@ -38,8 +38,16 @@ from stockpredictor.ui.dashboard import (
 )
 
 
-def test_dashboard_initial_render_has_no_runtime_exception() -> None:
-    dashboard = Path(__file__).parents[1] / "src" / "stockpredictor" / "ui" / "dashboard.py"
+def test_dashboard_initial_render_has_no_runtime_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = Path(__file__).parents[1]
+    dashboard = project_root / "src" / "stockpredictor" / "ui" / "dashboard.py"
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "default.yaml").write_text(
+        (project_root / "configs" / "default.example.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
 
     app = AppTest.from_file(str(dashboard), default_timeout=30).run()
 
