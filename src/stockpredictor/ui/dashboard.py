@@ -767,7 +767,10 @@ def _integer_signal_allocations(weights: dict[str, float | None], total: int = 1
 def _render_horizon_selector(container, horizon_options: list[str], default_horizon: str) -> str:
     options = horizon_options or ["swing"]
     default = default_horizon if default_horizon in options else options[0]
-    format_func = lambda value: str(value).replace("_", " ").title()
+
+    def format_func(value):
+        return str(value).replace("_", " ").title()
+
     help_text = "Intraday emphasizes session/VWAP behavior; swing uses multi-day signals; position uses a longer lookback and wider risk."
     if hasattr(container, "segmented_control"):
         selected = container.segmented_control("Horizon", options=options, default=default, format_func=format_func, help=help_text)

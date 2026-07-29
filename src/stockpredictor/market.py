@@ -17,7 +17,6 @@ import pandas as pd
 from .config import Settings
 from .contracts import MarketState, SectorContext
 from .data import MarketDataProvider, fetch_market_data
-from .utils import to_float
 
 
 LOGGER = logging.getLogger(__name__)
