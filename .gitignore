@@ -18,3 +18,8 @@ dist/
 build/
 *.egg-info/
 .streamlit/secrets.toml
+
+# Local assistant state
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
